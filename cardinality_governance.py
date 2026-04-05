@@ -240,6 +240,71 @@ def severity(mts_count):
     return "LOW"
 
 
+# Instrumentation source rules: (metric prefix/pattern, source label, description)
+INSTRUMENTATION_SOURCES = [
+    # OTel Collector internal metrics
+    (re.compile(r"^otelcol_"),                        "OTel Collector",      "Emitted by the OpenTelemetry Collector process itself (internal telemetry)"),
+    (re.compile(r"^otel\.sdk\."),                     "OTel SDK",            "Emitted by the OpenTelemetry SDK runtime (language agent self-metrics)"),
+    # Splunk-specific
+    (re.compile(r"^sf\."),                             "Splunk Agent",        "Emitted by Splunk Infrastructure Monitoring agent"),
+    (re.compile(r"^splunk\."),                         "Splunk Platform",     "Emitted by Splunk platform components"),
+    # Kubernetes / infra
+    (re.compile(r"^k8s\."),                            "Kubernetes",          "Kubernetes cluster/node/pod metrics via kubelet or kube-state-metrics"),
+    (re.compile(r"^container\."),                      "Container Runtime",   "Container runtime metrics (Docker/containerd)"),
+    (re.compile(r"^system\."),                         "Host / OS",           "Host-level system metrics (CPU, memory, disk, network)"),
+    (re.compile(r"^process\."),                        "Host / OS",           "Process-level metrics from the host metrics receiver"),
+    # JVM / language runtimes
+    (re.compile(r"^jvm\."),                            "JVM",                 "Java Virtual Machine runtime metrics (heap, GC, threads)"),
+    (re.compile(r"^process\.runtime\.jvm\."),          "JVM",                 "OTel semantic convention JVM runtime metrics"),
+    (re.compile(r"^nodejs\."),                         "Node.js Runtime",     "Node.js runtime metrics"),
+    (re.compile(r"^python\."),                         "Python Runtime",      "Python runtime metrics"),
+    # HTTP / web frameworks
+    (re.compile(r"^http\."),                           "HTTP Instrumentation","HTTP client/server metrics from OTel HTTP semantic conventions"),
+    # Databases
+    (re.compile(r"^db\."),                             "Database Client",     "Database client metrics from OTel DB semantic conventions"),
+    (re.compile(r"^mysql\."),                          "MySQL",               "MySQL database metrics"),
+    (re.compile(r"^postgresql\."),                     "PostgreSQL",          "PostgreSQL database metrics"),
+    (re.compile(r"^redis\."),                          "Redis",               "Redis metrics"),
+    (re.compile(r"^mongodb\."),                        "MongoDB",             "MongoDB metrics"),
+    # Messaging
+    (re.compile(r"^messaging\."),                      "Messaging",           "Messaging system metrics (Kafka, RabbitMQ, etc.)"),
+    (re.compile(r"^kafka\."),                          "Kafka",               "Apache Kafka metrics"),
+    # Cloud providers
+    (re.compile(r"^aws\."),                            "AWS",                 "AWS CloudWatch metrics"),
+    (re.compile(r"^azure\."),                          "Azure",               "Azure Monitor metrics"),
+    (re.compile(r"^gcp\."),                            "GCP",                 "Google Cloud Monitoring metrics"),
+    # Behavioral baseline (our own framework)
+    (re.compile(r"^behavioral_baseline\."),            "Behavioral Baseline Framework", "Custom metrics emitted by the behavioral anomaly detection framework"),
+    # Generic custom
+    (re.compile(r"^custom\."),                         "Custom (app)",        "Application-defined custom metric"),
+]
+
+
+def infer_instrumentation_source(metric_name, mts_list):
+    """
+    Infer the instrumentation source for a metric based on its name and dimensions.
+    Returns (source_label, description).
+    """
+    # Check name-based rules first
+    for pattern, label, desc in INSTRUMENTATION_SOURCES:
+        if pattern.match(metric_name):
+            return label, desc
+
+    # Fallback: inspect dimensions for clues
+    all_dims = set()
+    for mts in mts_list[:20]:
+        all_dims.update(mts.get("dimensions", {}).keys())
+
+    if "k8s.pod.name" in all_dims or "k8s.namespace.name" in all_dims:
+        return "Kubernetes (app)", "Application metric with Kubernetes resource attributes"
+    if "host.name" in all_dims or "os.type" in all_dims:
+        return "Host instrumentation", "Application metric with host resource attributes"
+    if "service.name" in all_dims or "service.version" in all_dims:
+        return "OTel SDK (app)", "Custom application metric instrumented via OTel SDK"
+
+    return "Unknown / Custom", "Source could not be determined from metric name or dimensions"
+
+
 def attribute_to_team(mts_list, tokens):
     """Best-effort attribution: look for service.name or token dimensions."""
     services = set()
@@ -296,6 +361,7 @@ def scan_org(top_n=50, verbose=False):
         # Analyze dimensions
         dim_analysis = analyze_dimensions(mts_list)
         attributed_to = attribute_to_team(mts_list, tokens)
+        instr_source, instr_desc = infer_instrumentation_source(name, mts_list)
 
         # Find worst offending dimension
         worst_dim = None
@@ -315,6 +381,8 @@ def scan_org(top_n=50, verbose=False):
             "worst_dim":      worst_dim,
             "worst_dim_info": worst_dim_info,
             "attributed_to":  attributed_to,
+            "instr_source":   instr_source,
+            "instr_desc":     instr_desc,
         })
 
     # Sort by MTS count descending
@@ -342,6 +410,7 @@ Type: {finding['type']}
 Custom metric: {finding['custom']}
 Total MTS count: {finding['mts_count']}
 Severity: {finding['severity']}
+Instrumentation source: {finding['instr_source']} — {finding['instr_desc']}
 Attributed to services/teams: {', '.join(finding['attributed_to'])}
 
 High-cardinality dimensions:
@@ -387,14 +456,14 @@ def generate_report(findings, use_claude=True):
     lines.append(f"| 🟡 MEDIUM (≥{MEDIUM_MTS_COUNT:,} MTS)   | {len(medium)} |")
 
     lines.append(f"\n## Top Offenders\n")
-    lines.append(f"| Rank | Metric | MTS Count | Severity | Worst Dimension | Attributed To |")
-    lines.append(f"|------|--------|-----------|----------|----------------|---------------|")
+    lines.append(f"| Rank | Metric | MTS Count | Severity | Instrumentation Source | Worst Dimension | Attributed To |")
+    lines.append(f"|------|--------|-----------|----------|-----------------------|----------------|---------------|")
     for i, f in enumerate(findings[:20], 1):
         worst = f["worst_dim"] or "—"
         worst_count = f["worst_dim_info"]["unique_values"] if f["worst_dim_info"] else 0
         teams = ", ".join(f["attributed_to"][:2])
         sev_icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}.get(f["severity"], "⚪")
-        lines.append(f"| {i} | `{f['metric']}` | {f['mts_count']:,} | {sev_icon} {f['severity']} | `{worst}` ({worst_count:,} values) | {teams} |")
+        lines.append(f"| {i} | `{f['metric']}` | {f['mts_count']:,} | {sev_icon} {f['severity']} | {f['instr_source']} | `{worst}` ({worst_count:,} values) | {teams} |")
 
     lines.append(f"\n## Detailed Findings\n")
 
@@ -403,6 +472,7 @@ def generate_report(findings, use_claude=True):
         lines.append(f"### {i}. `{f['metric']}` — {sev_icon} {f['severity']}")
         lines.append(f"\n- **MTS count:** {f['mts_count']:,}")
         lines.append(f"- **Metric type:** {f['type']} ({'custom' if f['custom'] else 'builtin'})")
+        lines.append(f"- **Instrumentation source:** {f['instr_source']} — *{f['instr_desc']}*")
         lines.append(f"- **Attributed to:** {', '.join(f['attributed_to'])}")
 
         if f["dimensions"]:
@@ -567,13 +637,14 @@ def main():
             print("No cardinality issues found.")
             return
 
-        print(f"\n{'Rank':<5} {'Metric':<50} {'MTS':>8} {'Severity':<10} {'Worst Dimension':<30} {'Attributed To'}")
-        print("-" * 130)
+        print(f"\n{'Rank':<5} {'Metric':<45} {'MTS':>8} {'Severity':<10} {'Source':<30} {'Worst Dimension':<30} {'Attributed To'}")
+        print("-" * 155)
         for i, f in enumerate(findings, 1):
             sev_icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}.get(f["severity"], "⚪")
             worst = f"{f['worst_dim']} ({f['worst_dim_info']['unique_values']:,})" if f["worst_dim"] else "—"
             teams = ", ".join(f["attributed_to"][:2])
-            print(f"{i:<5} {f['metric']:<50} {f['mts_count']:>8,} {sev_icon+f['severity']:<12} {worst:<30} {teams}")
+            source = f["instr_source"]
+            print(f"{i:<5} {f['metric']:<45} {f['mts_count']:>8,} {sev_icon+f['severity']:<12} {source:<30} {worst:<30} {teams}")
 
     elif args.command == "report":
         findings = scan_org(top_n=args.top)
