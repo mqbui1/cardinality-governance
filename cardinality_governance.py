@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 from collections import defaultdict
@@ -55,7 +56,9 @@ CARDINALITY_PATTERNS = [
     (re.compile(r".{100,}"),                                                                  "Very long string"),
 ]
 
-REPORTS_DIR = Path("reports")
+REPORTS_DIR  = Path("reports")
+STATE_DB     = Path("cardinality_state.db")
+TREND_GROWTH_WARN = 0.20   # flag if MTS grew >20% since last scan
 
 # ---------------------------------------------------------------------------
 # API helpers
@@ -138,8 +141,73 @@ def call_claude(prompt):
 # Scanning
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Trend tracking (SQLite)
+# ---------------------------------------------------------------------------
+
+def db_connect():
+    conn = sqlite3.connect(STATE_DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scans (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            scanned_at  TEXT NOT NULL,
+            realm       TEXT NOT NULL,
+            metric      TEXT NOT NULL,
+            mts_count   INTEGER NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def db_save_scan(findings):
+    """Persist current scan results to SQLite."""
+    conn = db_connect()
+    ts = datetime.now(timezone.utc).isoformat()
+    conn.executemany(
+        "INSERT INTO scans (scanned_at, realm, metric, mts_count) VALUES (?, ?, ?, ?)",
+        [(ts, REALM, f["metric"], f["mts_count"]) for f in findings]
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_get_previous(metric_name):
+    """Return (mts_count, scanned_at) from the most recent prior scan for this metric."""
+    if not STATE_DB.exists():
+        return None, None
+    conn = db_connect()
+    row = conn.execute(
+        """SELECT mts_count, scanned_at FROM scans
+           WHERE realm=? AND metric=?
+           ORDER BY scanned_at DESC LIMIT 1""",
+        (REALM, metric_name)
+    ).fetchone()
+    conn.close()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def db_get_history(metric_name, limit=10):
+    """Return list of (scanned_at, mts_count) for a metric, newest first."""
+    if not STATE_DB.exists():
+        return []
+    conn = db_connect()
+    rows = conn.execute(
+        """SELECT scanned_at, mts_count FROM scans
+           WHERE realm=? AND metric=?
+           ORDER BY scanned_at DESC LIMIT ?""",
+        (REALM, metric_name, limit)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Org info
+# ---------------------------------------------------------------------------
+
 def fetch_org_info():
-    """Get org-level MTS usage."""
+    """Get org-level MTS usage and limits."""
     try:
         return api_get("/v2/organization")
     except Exception as e:
@@ -156,14 +224,40 @@ def fetch_tokens():
         return []
 
 
-def fetch_metrics(limit=200):
-    """Fetch all custom metrics."""
-    try:
-        result = api_get("/v2/metric", params={"limit": limit})
-        return result.get("results", [])
-    except Exception as e:
-        print(f"  Warning: could not fetch metrics: {e}")
-        return []
+def fetch_metrics(limit=None):
+    """Fetch all metrics with pagination — returns complete list."""
+    metrics = []
+    page_size = 100
+    offset = None
+    fetched = 0
+
+    while True:
+        params = {"limit": page_size}
+        if offset:
+            params["offset"] = offset
+
+        try:
+            result = api_get("/v2/metric", params=params)
+        except Exception as e:
+            print(f"  Warning: metric fetch error: {e}")
+            break
+
+        page = result.get("results", [])
+        metrics.extend(page)
+        fetched += len(page)
+
+        if limit and fetched >= limit:
+            metrics = metrics[:limit]
+            break
+
+        # Check for next page via count vs fetched
+        total = result.get("count", 0)
+        if len(page) < page_size or fetched >= total:
+            break
+
+        offset = fetched
+
+    return metrics
 
 
 def fetch_mts_for_metric(metric_name, limit=10000):
@@ -319,17 +413,23 @@ def attribute_to_team(mts_list, tokens):
 def scan_org(top_n=50, verbose=False):
     """
     Full org scan. Returns list of findings sorted by MTS count descending.
+    Includes org limit awareness and week-over-week trend tracking.
     """
     print(f"\nScanning org (realm={REALM})...\n")
 
-    org = fetch_org_info()
+    org    = fetch_org_info()
     tokens = fetch_tokens()
 
-    token_map = {t.get("name", ""): t for t in tokens}
+    # Org MTS limit awareness
+    mts_limit = org.get("mtsCategoryInfo", {}).get("mtsLimitThreshold") \
+             or org.get("mtsLimit") \
+             or org.get("numResourcesMonitored")
+    if mts_limit:
+        print(f"  Org MTS limit: {mts_limit:,}")
 
-    # Fetch metrics
-    print("  Fetching metric catalog...")
-    metrics = fetch_metrics(limit=200)
+    # Fetch all metrics with pagination
+    print("  Fetching metric catalog (paginated)...")
+    metrics = fetch_metrics()
 
     if not metrics:
         print("  No metrics found. Check your token permissions.")
@@ -340,15 +440,15 @@ def scan_org(top_n=50, verbose=False):
     findings = []
 
     for i, metric in enumerate(metrics):
-        name = metric.get("name", "")
-        mtype = metric.get("type", "gauge")
+        name   = metric.get("name", "")
+        mtype  = metric.get("type", "gauge")
         custom = metric.get("custom", True)
 
         if verbose:
             print(f"  [{i+1}/{len(metrics)}] {name}")
 
         # Fetch MTS for this metric
-        mts_list = fetch_mts_for_metric(name, limit=10000)
+        mts_list  = fetch_mts_for_metric(name, limit=10000)
         mts_count = len(mts_list)
 
         if mts_count == 0:
@@ -358,17 +458,34 @@ def scan_org(top_n=50, verbose=False):
         if sev == "LOW" and not verbose:
             continue
 
+        # Trend: compare to previous scan
+        prev_count, prev_ts = db_get_previous(name)
+        if prev_count is not None:
+            growth_pct = (mts_count - prev_count) / prev_count if prev_count > 0 else 0
+            trend = "NEW"    if prev_count == 0 else \
+                    "GROWING" if growth_pct >= TREND_GROWTH_WARN else \
+                    "FALLING" if growth_pct <= -TREND_GROWTH_WARN else \
+                    "STABLE"
+        else:
+            prev_count = None
+            growth_pct = None
+            prev_ts    = None
+            trend      = "NEW"
+
+        # MTS limit % contribution
+        limit_pct = round(mts_count / mts_limit * 100, 2) if mts_limit else None
+
         # Analyze dimensions
-        dim_analysis = analyze_dimensions(mts_list)
+        dim_analysis  = analyze_dimensions(mts_list)
         attributed_to = attribute_to_team(mts_list, tokens)
         instr_source, instr_desc = infer_instrumentation_source(name, mts_list)
 
         # Find worst offending dimension
-        worst_dim = None
+        worst_dim      = None
         worst_dim_info = None
         for dim, info in dim_analysis.items():
             if worst_dim is None or info["unique_values"] > worst_dim_info["unique_values"]:
-                worst_dim = dim
+                worst_dim      = dim
                 worst_dim_info = info
 
         findings.append({
@@ -383,11 +500,21 @@ def scan_org(top_n=50, verbose=False):
             "attributed_to":  attributed_to,
             "instr_source":   instr_source,
             "instr_desc":     instr_desc,
+            "prev_count":     prev_count,
+            "prev_ts":        prev_ts,
+            "growth_pct":     growth_pct,
+            "trend":          trend,
+            "limit_pct":      limit_pct,
         })
 
     # Sort by MTS count descending
     findings.sort(key=lambda x: -x["mts_count"])
-    return findings[:top_n]
+    top = findings[:top_n]
+
+    # Persist results for next run's trend comparison
+    db_save_scan(top)
+
+    return top
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +575,17 @@ def generate_report(findings, use_claude=True):
     lines.append(f"**Realm:** {REALM}")
     lines.append(f"**Metrics analyzed:** {len(findings)}")
     lines.append(f"**Total MTS across findings:** {total_mts:,}")
+
+    # Org limit section
+    org = fetch_org_info()
+    mts_limit = org.get("mtsCategoryInfo", {}).get("mtsLimitThreshold") \
+             or org.get("mtsLimit") \
+             or org.get("numResourcesMonitored")
+    if mts_limit:
+        pct_used = round(total_mts / mts_limit * 100, 1)
+        lines.append(f"**Org MTS limit:** {mts_limit:,}")
+        lines.append(f"**Findings as % of org limit:** {pct_used}%")
+
     lines.append(f"\n## Summary\n")
     lines.append(f"| Severity | Count |")
     lines.append(f"|----------|-------|")
@@ -455,22 +593,53 @@ def generate_report(findings, use_claude=True):
     lines.append(f"| 🟠 HIGH (≥{HIGH_MTS_COUNT:,} MTS)     | {len(high)} |")
     lines.append(f"| 🟡 MEDIUM (≥{MEDIUM_MTS_COUNT:,} MTS)   | {len(medium)} |")
 
+    # Trend summary
+    growing = [f for f in findings if f.get("trend") == "GROWING"]
+    new     = [f for f in findings if f.get("trend") == "NEW"]
+    if growing or new:
+        lines.append(f"\n### Trend Alerts\n")
+        if new:
+            lines.append(f"- 🆕 **{len(new)} new metrics** appeared since last scan")
+        if growing:
+            lines.append(f"- 📈 **{len(growing)} metrics growing** >20% since last scan:")
+            for f in growing:
+                pct = int(f["growth_pct"] * 100)
+                lines.append(f"  - `{f['metric']}`: {f['prev_count']:,} → {f['mts_count']:,} MTS (+{pct}%)")
+
     lines.append(f"\n## Top Offenders\n")
-    lines.append(f"| Rank | Metric | MTS Count | Severity | Instrumentation Source | Worst Dimension | Attributed To |")
-    lines.append(f"|------|--------|-----------|----------|-----------------------|----------------|---------------|")
+    lines.append(f"| Rank | Metric | MTS Count | % of Limit | Trend | Severity | Instrumentation Source | Worst Dimension | Attributed To |")
+    lines.append(f"|------|--------|-----------|------------|-------|----------|-----------------------|----------------|---------------|")
     for i, f in enumerate(findings[:20], 1):
-        worst = f["worst_dim"] or "—"
+        worst      = f["worst_dim"] or "—"
         worst_count = f["worst_dim_info"]["unique_values"] if f["worst_dim_info"] else 0
-        teams = ", ".join(f["attributed_to"][:2])
-        sev_icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}.get(f["severity"], "⚪")
-        lines.append(f"| {i} | `{f['metric']}` | {f['mts_count']:,} | {sev_icon} {f['severity']} | {f['instr_source']} | `{worst}` ({worst_count:,} values) | {teams} |")
+        teams      = ", ".join(f["attributed_to"][:2])
+        sev_icon   = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}.get(f["severity"], "⚪")
+        trend_icon = {"GROWING": "📈", "FALLING": "📉", "NEW": "🆕", "STABLE": "➡️"}.get(f.get("trend", ""), "")
+        limit_str  = f"{f['limit_pct']}%" if f.get("limit_pct") is not None else "—"
+        trend_str  = f"{trend_icon} {f.get('trend','')}"
+        if f.get("growth_pct") and f.get("trend") == "GROWING":
+            trend_str += f" +{int(f['growth_pct']*100)}%"
+        lines.append(f"| {i} | `{f['metric']}` | {f['mts_count']:,} | {limit_str} | {trend_str} | {sev_icon} {f['severity']} | {f['instr_source']} | `{worst}` ({worst_count:,} values) | {teams} |")
 
     lines.append(f"\n## Detailed Findings\n")
 
     for i, f in enumerate(findings, 1):
         sev_icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}.get(f["severity"], "⚪")
         lines.append(f"### {i}. `{f['metric']}` — {sev_icon} {f['severity']}")
+        trend_icon = {"GROWING": "📈", "FALLING": "📉", "NEW": "🆕", "STABLE": "➡️"}.get(f.get("trend", ""), "")
+        trend_str  = f.get("trend", "")
+        if f.get("prev_count") is not None:
+            pct = int(f["growth_pct"] * 100) if f.get("growth_pct") is not None else 0
+            sign = f"+{pct}" if pct >= 0 else str(pct)
+            prev_ts_short = f["prev_ts"][:10] if f.get("prev_ts") else "?"
+            trend_str = f"{trend_icon} {trend_str} ({f['prev_count']:,} → {f['mts_count']:,}, {sign}% since {prev_ts_short})"
+        else:
+            trend_str = f"{trend_icon} {trend_str} (first scan)"
+
         lines.append(f"\n- **MTS count:** {f['mts_count']:,}")
+        if f.get("limit_pct") is not None:
+            lines.append(f"- **% of org MTS limit:** {f['limit_pct']}%")
+        lines.append(f"- **Trend:** {trend_str}")
         lines.append(f"- **Metric type:** {f['type']} ({'custom' if f['custom'] else 'builtin'})")
         lines.append(f"- **Instrumentation source:** {f['instr_source']} — *{f['instr_desc']}*")
         lines.append(f"- **Attributed to:** {', '.join(f['attributed_to'])}")
@@ -637,14 +806,16 @@ def main():
             print("No cardinality issues found.")
             return
 
-        print(f"\n{'Rank':<5} {'Metric':<45} {'MTS':>8} {'Severity':<10} {'Source':<30} {'Worst Dimension':<30} {'Attributed To'}")
-        print("-" * 155)
+        print(f"\n{'Rank':<5} {'Metric':<45} {'MTS':>8} {'Trend':<12} {'Severity':<12} {'Source':<28} {'Worst Dimension'}")
+        print("-" * 140)
         for i, f in enumerate(findings, 1):
-            sev_icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}.get(f["severity"], "⚪")
+            sev_icon   = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}.get(f["severity"], "⚪")
+            trend_icon = {"GROWING": "📈", "FALLING": "📉", "NEW": "🆕", "STABLE": "➡️"}.get(f.get("trend",""), "")
+            trend_str  = f"{trend_icon}{f.get('trend','')}"
+            if f.get("growth_pct") and f.get("trend") == "GROWING":
+                trend_str += f"(+{int(f['growth_pct']*100)}%)"
             worst = f"{f['worst_dim']} ({f['worst_dim_info']['unique_values']:,})" if f["worst_dim"] else "—"
-            teams = ", ".join(f["attributed_to"][:2])
-            source = f["instr_source"]
-            print(f"{i:<5} {f['metric']:<45} {f['mts_count']:>8,} {sev_icon+f['severity']:<12} {source:<30} {worst:<30} {teams}")
+            print(f"{i:<5} {f['metric']:<45} {f['mts_count']:>8,} {trend_str:<14} {sev_icon+f['severity']:<14} {f['instr_source']:<28} {worst}")
 
     elif args.command == "report":
         findings = scan_org(top_n=args.top)
