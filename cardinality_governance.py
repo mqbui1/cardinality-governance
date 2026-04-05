@@ -400,7 +400,10 @@ def infer_instrumentation_source(metric_name, mts_list):
 
 
 def attribute_to_team(mts_list, tokens):
-    """Best-effort attribution: look for service.name or token dimensions."""
+    """
+    Best-effort attribution. Returns list of service name strings (for backward compat).
+    Also populates a richer attribution dict accessible via attribute_detail().
+    """
     services = set()
     for mts in mts_list[:100]:
         dims = mts.get("dimensions", {})
@@ -408,6 +411,65 @@ def attribute_to_team(mts_list, tokens):
             if key in dims:
                 services.add(dims[key])
     return sorted(services) if services else ["unknown"]
+
+
+def attribute_detail(mts_list):
+    """
+    Returns a rich attribution dict:
+    {
+      "services":     [...],
+      "environments": [...],   # deployment.environment or service.namespace
+      "namespaces":   [...],   # k8s.namespace.name
+      "clusters":     [...],   # k8s.cluster.name
+      "pods":         [...],   # k8s.pod.name (sample)
+      "sdk":          "...",   # telemetry SDK info
+    }
+    """
+    services     = set()
+    environments = set()
+    namespaces   = set()
+    clusters     = set()
+    pods         = set()
+    sdk_versions = set()
+
+    for mts in mts_list[:200]:
+        dims = mts.get("dimensions", {})
+
+        # Services
+        for key in ["service.name", "service", "sf_service"]:
+            if key in dims:
+                services.add(dims[key])
+
+        # Environments
+        for key in ["deployment.environment", "environment", "sf_environment"]:
+            if key in dims:
+                environments.add(dims[key])
+        # Fallback: service.namespace as environment proxy
+        if not environments and "service.namespace" in dims:
+            environments.add(dims["service.namespace"])
+
+        # Kubernetes
+        if "k8s.namespace.name" in dims:
+            namespaces.add(dims["k8s.namespace.name"])
+        if "k8s.cluster.name" in dims:
+            clusters.add(dims["k8s.cluster.name"])
+        if "k8s.pod.name" in dims:
+            pods.add(dims["k8s.pod.name"])
+
+        # SDK
+        if "splunk.zc.method" in dims:
+            sdk_versions.add(dims["splunk.zc.method"])
+        elif "telemetry.sdk.name" in dims and "telemetry.sdk.version" in dims:
+            sdk_versions.add(f"{dims['telemetry.sdk.name']}:{dims['telemetry.sdk.version']}")
+
+    return {
+        "services":     sorted(services)     or ["unknown"],
+        "environments": sorted(environments) or [],
+        "namespaces":   sorted(namespaces)   or [],
+        "clusters":     sorted(clusters)     or [],
+        "pods":         sorted(pods)[:5],     # sample only
+        "sdk":          ", ".join(sorted(sdk_versions)) if sdk_versions else "",
+    }
 
 
 def scan_org(top_n=50, verbose=False):
@@ -478,6 +540,7 @@ def scan_org(top_n=50, verbose=False):
         # Analyze dimensions
         dim_analysis  = analyze_dimensions(mts_list)
         attributed_to = attribute_to_team(mts_list, tokens)
+        attribution   = attribute_detail(mts_list)
         instr_source, instr_desc = infer_instrumentation_source(name, mts_list)
 
         # Find worst offending dimension
@@ -500,6 +563,7 @@ def scan_org(top_n=50, verbose=False):
             "attributed_to":  attributed_to,
             "instr_source":   instr_source,
             "instr_desc":     instr_desc,
+            "attribution":    attribution,
             "prev_count":     prev_count,
             "prev_ts":        prev_ts,
             "growth_pct":     growth_pct,
@@ -538,7 +602,11 @@ Custom metric: {finding['custom']}
 Total MTS count: {finding['mts_count']}
 Severity: {finding['severity']}
 Instrumentation source: {finding['instr_source']} — {finding['instr_desc']}
-Attributed to services/teams: {', '.join(finding['attributed_to'])}
+Services: {', '.join(finding.get('attribution', {}).get('services', finding['attributed_to']))}
+Environments: {', '.join(finding.get('attribution', {}).get('environments', [])) or 'unknown'}
+Clusters: {', '.join(finding.get('attribution', {}).get('clusters', [])) or 'unknown'}
+Namespaces: {', '.join(finding.get('attribution', {}).get('namespaces', [])) or 'unknown'}
+SDK: {finding.get('attribution', {}).get('sdk', 'unknown')}
 
 High-cardinality dimensions:
 {dim_summary}
@@ -642,7 +710,18 @@ def generate_report(findings, use_claude=True):
         lines.append(f"- **Trend:** {trend_str}")
         lines.append(f"- **Metric type:** {f['type']} ({'custom' if f['custom'] else 'builtin'})")
         lines.append(f"- **Instrumentation source:** {f['instr_source']} — *{f['instr_desc']}*")
-        lines.append(f"- **Attributed to:** {', '.join(f['attributed_to'])}")
+
+        # Rich attribution
+        attr = f.get("attribution", {})
+        lines.append(f"- **Services:** {', '.join(attr.get('services', f['attributed_to']))}")
+        if attr.get("environments"):
+            lines.append(f"- **Environments:** {', '.join(attr['environments'])}")
+        if attr.get("clusters"):
+            lines.append(f"- **Clusters:** {', '.join(attr['clusters'])}")
+        if attr.get("namespaces"):
+            lines.append(f"- **Namespaces:** {', '.join(attr['namespaces'])}")
+        if attr.get("sdk"):
+            lines.append(f"- **SDK:** {attr['sdk']}")
 
         if f["dimensions"]:
             lines.append(f"\n**High-cardinality dimensions:**\n")
