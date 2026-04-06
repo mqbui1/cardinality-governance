@@ -29,14 +29,15 @@ High-cardinality metrics are the #1 cause of surprise overage bills in Splunk Ob
 13. **Dimension drill-down** — `drilldown --dimension <name>` scans every metric in the org for that dimension, ranks by unique value count, shows combined MTS + cost, and generates a single fix YAML covering the full blast radius
 14. **False positive suppression** — `ignore <pattern>` excludes a metric name or glob (e.g. `sf.org.*`, `otelcol_*`) from all future scans and reports; `unignore` removes it; ignored count shown in report summary
 15. **Scan history** — `history` prints a table of past scans (total metrics, MTS, cost, severity counts) with a trend arrow showing whether the org is getting better or worse over time
-16. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
+16. **HTML report** — `report --format html` generates a self-contained HTML file with sortable tables, tabbed layout, stat cards, alert banners, collapsible findings, and fix YAML — no external dependencies, shareable as a single file
+17. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
 
 ## Modes
 
 | Command | Description |
 |---------|-------------|
 | `scan` | Quick ranked table of top offenders with trend, source, and severity |
-| `report` | Full Markdown report saved to `reports/` with AI remediation for CRITICAL/HIGH |
+| `report` | Full Markdown or HTML report saved to `reports/` with AI remediation for CRITICAL/HIGH |
 | `watch` | Continuous polling — emits Splunk custom events on new explosions and growth spikes |
 | `rollup` | Deep-dive on a single metric — dimension analysis + SignalFlow rollup + OTel processor config |
 | `resolve` | Manually mark a metric as remediated after applying a fix |
@@ -79,6 +80,12 @@ python3 cardinality_governance.py report
 
 # Report without AI — faster, no Bedrock credentials needed
 python3 cardinality_governance.py report --no-ai
+
+# HTML report — opens in browser automatically on macOS
+python3 cardinality_governance.py report --format html
+
+# Generate both Markdown and HTML
+python3 cardinality_governance.py report --format both --no-ai
 
 # Report for top 100 metrics
 python3 cardinality_governance.py report --top 100
@@ -238,6 +245,26 @@ Combined MTS: 1,539 | Metrics in group: 5 | One fix resolves all 5
 #### Family: `http.client.request.duration_*`
 Combined MTS: 1,539 | Variants: 5 | Shared problem dimension: `server.address`
 ```
+
+## HTML report
+
+```bash
+python3 cardinality_governance.py report --format html --no-ai
+```
+
+Generates a self-contained `.html` file in `reports/` — no external dependencies, shareable as a single file attachment. Opens automatically in the browser on macOS.
+
+**Six tabs:**
+- **Top Offenders** — full ranked table with MTS, cost, severity, trend, source, worst dimension
+- **Service Scorecard** — per-service MTS and cost with inline progress bars
+- **Duplicate Groups** — metrics sharing the same root cause, with collapsible fix YAML per group
+- **Resolved** — confirmed remediations with MTS and cost savings
+- **Detailed Findings** — collapsible per-metric detail with dimension tables and AI remediation
+- **Ignored** — active ignore patterns
+
+**All tables are sortable** — click any column header to sort ascending/descending.
+
+**Summary cards** at the top show total MTS, estimated cost, severity counts, and cumulative savings at a glance.
 
 ## False positive suppression
 
