@@ -582,8 +582,68 @@ def scan_org(top_n=50, verbose=False):
 
 
 # ---------------------------------------------------------------------------
-# Claude analysis
+# Fix suggestion generator
 # ---------------------------------------------------------------------------
+
+def generate_fix_yaml(dim, metrics, dim_info):
+    """
+    Generate ready-to-paste OTel Collector processor YAML to drop or hash
+    a high-cardinality dimension for a group of metrics.
+
+    Returns a dict with keys:
+      filter_processor   — drops the dimension entirely
+      transform_processor — hashes the value (preserves grouping, kills cardinality)
+      signalflow_rollup   — SignalFlow snippet that aggregates away the dimension
+    """
+    metric_list = "\n".join(f"            - '{m}'" for m in sorted(metrics))
+    pattern_note = f"  # anti-pattern: {dim_info['pattern']}" if dim_info.get("pattern") else ""
+    unique_vals = dim_info.get("unique_values", "?")
+
+    # --- filter/transform processor: delete the attribute ---
+    filter_yaml = f"""\
+# OTel Collector processor — drop `{dim}` from {len(metrics)} metric(s)
+# Dimension has {unique_vals} unique values{(' (' + dim_info['pattern'] + ')') if dim_info.get('pattern') else ''}
+# Effect: eliminates the cardinality explosion; metric is still reported per remaining dimensions.
+processors:
+  transform/drop_{dim.replace('.', '_')}:
+    metric_statements:
+      - context: datapoint
+        statements:
+          - delete_key(attributes, "{dim}"){pattern_note}
+        # Apply only to these metrics (remove 'include' block to apply to all):
+        include:
+          match_type: strict
+          metric_names:
+{metric_list}
+
+service:
+  pipelines:
+    metrics:
+      processors: [transform/drop_{dim.replace('.', '_')}, ...]"""
+
+    # --- transform processor: hash the value (keeps some grouping signal) ---
+    transform_yaml = f"""\
+# Alternative: hash `{dim}` instead of dropping — preserves cardinality grouping signal
+# at low cost. Use when you still need to correlate across restarts/redeploys.
+processors:
+  transform/hash_{dim.replace('.', '_')}:
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(attributes["{dim}"], SHA256(attributes["{dim}"]))
+        include:
+          match_type: strict
+          metric_names:
+{metric_list}"""
+
+    # --- SignalFlow rollup that aggregates away the dimension ---
+    return {
+        "filter_processor": filter_yaml,
+        "transform_processor": transform_yaml,
+    }
+
+
+
 
 def generate_remediation(finding):
     """Use Claude to generate a specific remediation recommendation."""
@@ -749,6 +809,15 @@ def generate_report(findings, use_claude=True):
                     lines.append(f"| `{f['metric']}` | {f['mts_count']:,} | {sev_icon} {f['severity']} |")
                 lines.append("")
 
+                # Generate fix YAML for this group
+                metric_names = [f["metric"] for f in group]
+                fix = generate_fix_yaml(dim, metric_names, dim_info)
+                lines.append(f"**Fix: OTel Collector processor (drop `{dim}`):**")
+                lines.append(f"```yaml\n{fix['filter_processor']}\n```")
+                lines.append(f"<details><summary>Alternative: hash instead of drop</summary>\n")
+                lines.append(f"```yaml\n{fix['transform_processor']}\n```")
+                lines.append(f"</details>\n")
+
         # Metric name family groups (same stem, different suffixes)
         if prefix_multi:
             lines.append(f"### Grouped by Metric Family (same root name)\n")
@@ -766,6 +835,18 @@ def generate_report(findings, use_claude=True):
                     worst = f["worst_dim"] or "—"
                     lines.append(f"| `{f['metric']}` | {f['mts_count']:,} | `{worst}` |")
                 lines.append("")
+
+                # Generate fix for the primary shared dimension (highest unique-value count)
+                primary_dim = max(worst_dims, key=lambda d: next(
+                    (f["worst_dim_info"]["unique_values"] for f in group if f["worst_dim"] == d), 0
+                ))
+                primary_dim_info = next(
+                    (f["worst_dim_info"] for f in group if f["worst_dim"] == primary_dim), {}
+                ) or {}
+                metric_names = [f["metric"] for f in group]
+                fix = generate_fix_yaml(primary_dim, metric_names, primary_dim_info)
+                lines.append(f"**Fix: OTel Collector processor (drop `{primary_dim}` from all {len(group)} variants):**")
+                lines.append(f"```yaml\n{fix['filter_processor']}\n```\n")
 
     lines.append(f"\n## Detailed Findings\n")
 
