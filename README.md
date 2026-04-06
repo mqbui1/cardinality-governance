@@ -27,7 +27,9 @@ High-cardinality metrics are the #1 cause of surprise overage bills in Splunk Ob
 11. **Cost estimation** — maps MTS count to estimated monthly cost (default `$0.002/MTS/mo`, configurable via `MTS_COST_PER_MONTH` env var); shown in report header, Top Offenders table, and per-service scorecard
 12. **Savings summary** — report header and Resolved Findings section show cumulative MTS and cost saved across all remediated metrics
 13. **Dimension drill-down** — `drilldown --dimension <name>` scans every metric in the org for that dimension, ranks by unique value count, shows combined MTS + cost, and generates a single fix YAML covering the full blast radius
-14. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
+14. **False positive suppression** — `ignore <pattern>` excludes a metric name or glob (e.g. `sf.org.*`, `otelcol_*`) from all future scans and reports; `unignore` removes it; ignored count shown in report summary
+15. **Scan history** — `history` prints a table of past scans (total metrics, MTS, cost, severity counts) with a trend arrow showing whether the org is getting better or worse over time
+16. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
 
 ## Modes
 
@@ -39,6 +41,10 @@ High-cardinality metrics are the #1 cause of surprise overage bills in Splunk Ob
 | `rollup` | Deep-dive on a single metric — dimension analysis + SignalFlow rollup + OTel processor config |
 | `resolve` | Manually mark a metric as remediated after applying a fix |
 | `drilldown` | Show every metric carrying a given dimension — full blast radius + combined fix YAML |
+| `ignore` | Exclude a metric name or glob pattern from future scans and reports |
+| `unignore` | Remove a pattern from the ignore list |
+| `ignored` | List all currently ignored patterns |
+| `history` | Show scan history — total MTS, cost, and severity trend over time |
 
 ## Setup
 
@@ -93,6 +99,16 @@ python3 cardinality_governance.py resolve --metric http.client.request.duration_
 # Dimension drill-down — full blast radius for a specific dimension
 python3 cardinality_governance.py drilldown --dimension server.address
 python3 cardinality_governance.py drilldown --dimension container.id --top 20
+
+# Ignore metrics you can't control (Splunk internals, collector telemetry)
+python3 cardinality_governance.py ignore "sf.org.*" --reason "Splunk internal — cannot remediate"
+python3 cardinality_governance.py ignore "otelcol_*" --reason "Collector internal telemetry"
+python3 cardinality_governance.py ignored          # list all ignored patterns
+python3 cardinality_governance.py unignore "sf.org.*"
+
+# Scan history — trend over time
+python3 cardinality_governance.py history
+python3 cardinality_governance.py history --limit 10
 ```
 
 ## Scan output columns
@@ -222,6 +238,48 @@ Combined MTS: 1,539 | Metrics in group: 5 | One fix resolves all 5
 #### Family: `http.client.request.duration_*`
 Combined MTS: 1,539 | Variants: 5 | Shared problem dimension: `server.address`
 ```
+
+## False positive suppression
+
+Some metrics will always appear as findings even though nothing can be done about them — `sf.org.*` Splunk internal metrics, `otelcol_*` collector self-telemetry, etc. The ignore list excludes these permanently so the report stays focused on actionable findings.
+
+```bash
+# Ignore Splunk internal metrics
+python3 cardinality_governance.py ignore "sf.org.*" --reason "Splunk internal — cannot remediate"
+
+# Ignore OTel Collector internal metrics
+python3 cardinality_governance.py ignore "otelcol_*" --reason "Collector internal telemetry"
+
+# List active patterns
+python3 cardinality_governance.py ignored
+
+# Remove a pattern
+python3 cardinality_governance.py unignore "sf.org.*"
+```
+
+Patterns support `fnmatch` glob syntax (`*` matches any characters, `?` matches one character). Ignored patterns are stored in `cardinality_state.db` and persist across runs. The report Summary table shows the ignored count.
+
+## Scan history
+
+Every `scan` or `report` run saves a summary row to SQLite. The `history` command shows the trend over time:
+
+```bash
+python3 cardinality_governance.py history
+```
+
+```
+Scan history (realm=us1, last 7 scans)
+
+Date                    Metrics  Total MTS  Est Cost/Mo     🔴     🟠     🟡  Ignored
+2026-04-01 08:00          1,038     12,450     ~$24.90     8      5      3       12
+2026-04-02 08:00          1,041     13,200     ~$26.40    10      5      3       12
+2026-04-03 08:00          1,041      9,800     ~$19.60     6      4      3       12
+...
+
+Trend over 7 scans: 📉 DOWN 21.3%  (-2,650 MTS  /  ~-$5.30/mo)
+```
+
+Shows whether the org's cardinality is trending better or worse, and quantifies the impact of remediations over time.
 
 ## Dimension drill-down
 
