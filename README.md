@@ -506,3 +506,85 @@ Rank  Metric                                             Baseline    Current    
 Rank  Metric                                                  MTS  Source                    Services / Token
 1     otelcol_k8s_pod_association                              65  OTel Collector            otel-agent
 ```
+
+## Trace (APM) spike comparison
+
+Identify which services drove a spike in trace/span volume (TAPM) by comparing two time windows.
+
+```bash
+# Step 1: save a snapshot of current trace volumes
+python3 cardinality_governance.py trace-scan --environment petclinicmbtest
+
+# Step 2: compare a stored snapshot vs live data now
+python3 cardinality_governance.py trace-compare \
+  --date1 2026-04-01 --date2 now --environment petclinicmbtest
+
+# Compare two stored dates
+python3 cardinality_governance.py trace-compare \
+  --date1 2026-03-20 --date2 2026-04-01 --environment petclinicmbtest
+
+# Lower the delta threshold and show services that dropped too
+python3 cardinality_governance.py trace-compare \
+  --date1 2026-04-01 --date2 now --environment petclinicmbtest \
+  --min-delta 5 --show-dropped
+
+# All environments (no filter)
+python3 cardinality_governance.py trace-compare --date1 2026-04-01 --date2 now
+```
+
+**Output sections:**
+
+| Section | What it shows |
+|---|---|
+| Summary header | Total sampled spans baseline → compared, net delta |
+| Top Span Increases | Services with ≥ `--min-delta` span growth, with error rate change |
+| New Services | Services that appear in compared but not baseline |
+| Biggest Drops | (with `--show-dropped`) Services that shrank most |
+
+**`trace-scan` options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--environment` / `-e` | all | APM environment to filter |
+| `--lookback` | 1.0 | Hours of trace history to sample |
+| `--no-save` | off | Print only, don't persist snapshot |
+
+**`trace-compare` options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--date1` / `--date2` | required | `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, or `now` |
+| `--environment` / `-e` | all | APM environment (strongly recommended) |
+| `--min-delta` | 10 | Minimum span count change to include |
+| `--top` | 20 | Max services per section |
+| `--lookback` | 1.0 | Window size (hours) for live snapshots |
+| `--show-dropped` | off | Show services with biggest decreases |
+| `--no-new` | off | Hide new services section |
+
+**How it works:**
+
+Span counts are derived from a 200-trace sample per window. The sample is proportional, so relative changes between services are reliable — a service whose span count doubles in the sample has roughly doubled in reality. Absolute counts reflect the sample, not total ingest volume.
+
+The `--environment` filter is strongly recommended to avoid mixing data from dev/staging/prod.
+
+**Tip:** Add `trace-scan` to cron to build history:
+```cron
+0 * * * *  cd /path/to/cardinality-governance && SPLUNK_ACCESS_TOKEN=... python3 cardinality_governance.py trace-scan --environment myenv
+```
+
+**Example output:**
+```
+Trace Spike Comparison  (realm=us1)  env=petclinicmbtest  generated 2026-04-06 16:50 UTC
+
+  Baseline  (2026-04-01T08:00):         312 spans sampled
+  Compared  (2026-04-06T16:50):         673 spans sampled
+  Net change:               +      361 spans  (+115.7%)
+
+===================================================================================================================
+  TOP SPAN INCREASES  (>=10 span delta)  --  3 service(s)
+===================================================================================================================
+  Service                              Baseline   Current     Delta   Change  ErrRate Baseline  ErrRate Now  Err Delta
+  api-gateway                               85       221      +136  +160.0%             0.0%         0.0%      +0.0pp
+  customers-service                         63       211      +148  +234.9%             2.1%         0.0%      -2.1pp
+  mysql:petclinic                           40       137       +97  +242.5%             0.0%         0.0%      +0.0pp
+```

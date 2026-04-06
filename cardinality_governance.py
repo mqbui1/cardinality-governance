@@ -2025,6 +2025,385 @@ def cmd_compare(date1, date2, top_n=20, min_delta=100, show_new=True, show_dropp
         print(f"  No metrics exceeded the minimum delta of {min_delta:,} MTS.")
         print(f"  Use --min-delta to lower the threshold.\n")
 
+
+# ---------------------------------------------------------------------------
+# Trace (APM) spike comparison
+# ---------------------------------------------------------------------------
+
+APM_URL = f"https://app.{REALM}.signalfx.com"
+TOPO_URL = f"https://api.{REALM}.signalfx.com"
+
+# Token for APM calls — same as metrics token
+APM_HDR = {"X-SF-TOKEN": TOKEN, "Content-Type": "application/json"}
+
+
+def _apm_hdr():
+    return {"X-SF-TOKEN": TOKEN, "Content-Type": "application/json"}
+
+
+def fetch_services(environment=None, lookback_hours=2):
+    """Return list of real (non-inferred) service names via topology API."""
+    now   = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - lookback_hours * 3600))
+    body  = {"timeRange": f"{start}/{now}"}
+    if environment:
+        body["tagFilters"] = [{"name": "sf_environment", "operator": "equals",
+                               "value": environment, "scope": "global"}]
+    try:
+        resp = requests.post(f"{TOPO_URL}/v2/apm/topology", headers=_apm_hdr(), json=body, timeout=30)
+        nodes = (resp.json().get("data") or {}).get("nodes", [])
+        return [n["serviceName"] for n in nodes if not n.get("inferred")]
+    except Exception:
+        return []
+
+
+def _start_analytics(parameters):
+    body = {
+        "operationName": "StartAnalyticsSearch",
+        "variables": {"parameters": parameters},
+        "query": "query StartAnalyticsSearch($parameters: JSON!) { startAnalyticsSearch(parameters: $parameters) }",
+    }
+    try:
+        r = requests.post(f"{APM_URL}/v2/apm/graphql?op=StartAnalyticsSearch",
+                          headers=_apm_hdr(), json=body, timeout=30)
+        return ((r.json().get("data") or {}).get("startAnalyticsSearch") or {}).get("jobId")
+    except Exception:
+        return None
+
+
+def _poll_analytics(job_id, max_polls=20):
+    body = {
+        "operationName": "GetAnalyticsSearch",
+        "variables": {"jobId": job_id},
+        "query": "query GetAnalyticsSearch($jobId: ID!) { getAnalyticsSearch(jobId: $jobId) }",
+    }
+    for _ in range(max_polls):
+        time.sleep(2)
+        try:
+            r = requests.post(f"{APM_URL}/v2/apm/graphql?op=GetAnalyticsSearch",
+                              headers=_apm_hdr(), json=body, timeout=30)
+            d = ((r.json().get("data") or {}).get("getAnalyticsSearch") or {})
+            sections = d.get("sections", [])
+            if sections:
+                return sections
+        except Exception:
+            pass
+    return []
+
+
+def fetch_trace_snapshot(start_ms, end_ms, environment=None, sample_limit=200):
+    """
+    Sample traces in [start_ms, end_ms] and return per-service aggregated metrics.
+    Returns dict:
+        {service_name: {
+            "span_count": N,       # sampled spans (proportional to real volume)
+            "trace_count": N,      # sampled traces (for this service as initiator)
+            "error_count": N,      # spans with errors
+            "error_rate": 0.0-1.0,
+        }}
+    Also returns metadata: {"sample_size": N, "time_range_ms": N}
+    """
+    trace_filters = []
+    if environment:
+        trace_filters.append({
+            "traceFilter": {
+                "tags": [{"tag": "sf_environment", "operation": "IN", "values": [environment]}]
+            },
+            "filterType": "traceFilter",
+        })
+
+    parameters = {
+        "sharedParameters": {
+            "timeRangeMillis": {"gte": start_ms, "lte": end_ms},
+            "filters": trace_filters,
+            "samplingFactor": 100,
+        },
+        "sectionsParameters": [
+            {"sectionType": "traceExamples", "limit": sample_limit},
+        ],
+    }
+
+    job_id = _start_analytics(parameters)
+    if not job_id:
+        return {}, {"sample_size": 0, "time_range_ms": end_ms - start_ms}
+
+    sections = _poll_analytics(job_id)
+    svc_spans  = defaultdict(int)
+    svc_traces = defaultdict(int)
+    svc_errors = defaultdict(int)
+    sample_size = 0
+
+    for section in sections:
+        if section.get("sectionType") != "traceExamples":
+            continue
+        examples = section.get("legacyTraceExamples") or []
+        sample_size = len(examples)
+        for ex in examples:
+            init_svc = ex.get("initiatingService", "unknown")
+            svc_traces[init_svc] += 1
+            for ssc in (ex.get("serviceSpanCounts") or []):
+                svc  = ssc.get("service", "unknown")
+                cnt  = ssc.get("spanCount", 0)
+                errs = len(ssc.get("errors") or [])
+                svc_spans[svc]  += cnt
+                svc_errors[svc] += errs
+
+    result = {}
+    all_svcs = set(svc_spans) | set(svc_traces)
+    for svc in all_svcs:
+        spans  = svc_spans[svc]
+        errors = svc_errors[svc]
+        result[svc] = {
+            "span_count":  spans,
+            "trace_count": svc_traces[svc],
+            "error_count": errors,
+            "error_rate":  round(errors / spans, 4) if spans > 0 else 0.0,
+        }
+
+    meta = {"sample_size": sample_size, "time_range_ms": end_ms - start_ms}
+    return result, meta
+
+
+def db_save_trace_summary(scanned_at, environment, snapshot):
+    """Persist a trace snapshot to SQLite for later comparison."""
+    conn = db_connect()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trace_snapshots (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            scanned_at  TEXT NOT NULL,
+            realm       TEXT NOT NULL,
+            environment TEXT NOT NULL DEFAULT '',
+            service     TEXT NOT NULL,
+            span_count  INTEGER NOT NULL,
+            trace_count INTEGER NOT NULL,
+            error_count INTEGER NOT NULL,
+            error_rate  REAL NOT NULL
+        )
+    """)
+    conn.commit()
+    rows = [
+        (scanned_at, REALM, environment or "", svc,
+         info["span_count"], info["trace_count"], info["error_count"], info["error_rate"])
+        for svc, info in snapshot.items()
+    ]
+    conn.executemany(
+        """INSERT INTO trace_snapshots
+           (scanned_at, realm, environment, service, span_count, trace_count, error_count, error_rate)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_get_trace_snapshot_near_date(target_date_str, environment=None):
+    """
+    Load the stored trace snapshot closest to target_date_str.
+    Returns (snapshot_dict, actual_ts) or ({}, None).
+    """
+    if not STATE_DB.exists():
+        return {}, None
+    conn = db_connect()
+    # Ensure table exists
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trace_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scanned_at TEXT, realm TEXT, environment TEXT DEFAULT '',
+            service TEXT, span_count INTEGER, trace_count INTEGER,
+            error_count INTEGER, error_rate REAL
+        )
+    """)
+    conn.commit()
+    env_clause = "AND environment=?" if environment else ""
+    env_args   = (environment,) if environment else ()
+
+    row = conn.execute(
+        f"""SELECT scanned_at FROM trace_snapshots
+           WHERE realm=? {env_clause}
+           ORDER BY ABS(JULIANDAY(scanned_at) - JULIANDAY(?)) ASC
+           LIMIT 1""",
+        (REALM,) + env_args + (target_date_str,)
+    ).fetchone()
+    if not row:
+        conn.close()
+        return {}, None
+
+    nearest_ts = row[0]
+    rows = conn.execute(
+        f"""SELECT service, span_count, trace_count, error_count, error_rate
+           FROM trace_snapshots
+           WHERE realm=? {env_clause} AND ABS(JULIANDAY(scanned_at) - JULIANDAY(?)) < 0.001
+           ORDER BY span_count DESC""",
+        (REALM,) + env_args + (nearest_ts,)
+    ).fetchall()
+    conn.close()
+
+    snapshot = {
+        r[0]: {"span_count": r[1], "trace_count": r[2],
+               "error_count": r[3], "error_rate": r[4]}
+        for r in rows
+    }
+    return snapshot, nearest_ts
+
+
+def cmd_scan_traces(environment=None, lookback_hours=1, save=True):
+    """Quick trace scan: fetch snapshot and print per-service summary."""
+    now_ms   = int(time.time() * 1000)
+    start_ms = now_ms - int(lookback_hours * 3600 * 1000)
+    ts       = datetime.now(timezone.utc).isoformat()
+
+    env_label = environment or "(all environments)"
+    print(f"\nTrace Scan  (realm={REALM})  env={env_label}  last {lookback_hours}h\n")
+
+    snapshot, meta = fetch_trace_snapshot(start_ms, now_ms, environment=environment)
+    if not snapshot:
+        print("  No trace data found. Verify the environment name and that APM data is being ingested.")
+        return
+
+    print(f"  Sample: {meta['sample_size']} traces sampled over {lookback_hours}h\n")
+    print(f"  {'Service':<40} {'Spans':>8} {'Traces':>8} {'Errors':>8} {'Err%':>7}")
+    print("  " + "-" * 76)
+    for svc, info in sorted(snapshot.items(), key=lambda x: -x[1]["span_count"]):
+        err_pct = f"{info['error_rate']*100:.1f}%"
+        print(f"  {svc:<40} {info['span_count']:>8,} {info['trace_count']:>8,} "
+              f"{info['error_count']:>8,} {err_pct:>7}")
+
+    if save:
+        db_save_trace_summary(ts, environment or "", snapshot)
+        print(f"\n  Snapshot saved to {STATE_DB} at {ts[:16]}")
+
+
+def cmd_compare_traces(date1, date2, environment=None, top_n=20, min_delta=50,
+                       show_new=True, show_dropped=False, lookback_hours=1):
+    """
+    Compare trace/span volumes between two dates, broken down by service.
+    """
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    env_label = environment or "(all environments)"
+    print(f"\nTrace Spike Comparison  (realm={REALM})  env={env_label}  generated {now_str}\n")
+
+    now_ms = int(time.time() * 1000)
+    window_ms = int(lookback_hours * 3600 * 1000)
+
+    LIVE = "now"
+
+    def load_snap(date_str, label):
+        if date_str.lower() == LIVE:
+            print(f"  Fetching live trace snapshot for {label} (last {lookback_hours}h)...")
+            snap, meta = fetch_trace_snapshot(now_ms - window_ms, now_ms, environment=environment)
+            ts = datetime.now(timezone.utc).isoformat()
+            print(f"  Live: {meta['sample_size']} traces sampled, {len(snap)} services")
+            if snap:
+                db_save_trace_summary(ts, environment or "", snap)
+            return snap, ts
+        else:
+            snap, ts = db_get_trace_snapshot_near_date(date_str, environment=environment)
+            if snap:
+                print(f"  Loaded stored trace snapshot for {label}: {len(snap)} services from {ts[:16]}")
+            else:
+                print(f"  No stored snapshot near \'{date_str}\' — fetching live instead...")
+                snap, meta = fetch_trace_snapshot(now_ms - window_ms, now_ms, environment=environment)
+                ts = datetime.now(timezone.utc).isoformat()
+                print(f"  Live: {meta['sample_size']} traces sampled, {len(snap)} services")
+                if snap:
+                    db_save_trace_summary(ts, environment or "", snap)
+            return snap, ts
+
+    snap1, ts1 = load_snap(date1, "baseline")
+    snap2, ts2 = load_snap(date2, "compared")
+
+    if not snap1 and not snap2:
+        print("\n  No data. Run \'trace-scan\' first to build history, or use \'now\' as a date.")
+        return
+
+    print()
+
+    # Join snapshots
+    all_svcs = set(snap1) | set(snap2)
+    deltas = []
+    for svc in all_svcs:
+        s1 = snap1.get(svc, {"span_count": 0, "trace_count": 0, "error_count": 0, "error_rate": 0.0})
+        s2 = snap2.get(svc, {"span_count": 0, "trace_count": 0, "error_count": 0, "error_rate": 0.0})
+        span_delta  = s2["span_count"]  - s1["span_count"]
+        trace_delta = s2["trace_count"] - s1["trace_count"]
+        span_pct    = round(span_delta / s1["span_count"] * 100, 1) if s1["span_count"] > 0 else (100.0 if s2["span_count"] > 0 else 0.0)
+        err1 = s1["error_rate"] * 100
+        err2 = s2["error_rate"] * 100
+        err_delta = round(err2 - err1, 2)
+        deltas.append({
+            "service":     svc,
+            "spans1":      s1["span_count"],
+            "spans2":      s2["span_count"],
+            "span_delta":  span_delta,
+            "span_pct":    span_pct,
+            "traces1":     s1["trace_count"],
+            "traces2":     s2["trace_count"],
+            "err_rate1":   err1,
+            "err_rate2":   err2,
+            "err_delta":   err_delta,
+        })
+
+    total_spans1  = sum(d["spans1"]  for d in deltas)
+    total_spans2  = sum(d["spans2"]  for d in deltas)
+    total_delta   = total_spans2 - total_spans1
+    total_pct     = round(total_delta / total_spans1 * 100, 1) if total_spans1 > 0 else 0.0
+
+    arrow = "+" if total_delta >= 0 else "-"
+    print(f"  Baseline  ({ts1[:16]}):  {total_spans1:>10,} spans sampled")
+    print(f"  Compared  ({ts2[:16]}):  {total_spans2:>10,} spans sampled")
+    print(f"  Net change:               {arrow}{abs(total_delta):>9,} spans  ({total_pct:+.1f}%)")
+    print()
+    print(f"  Note: span counts are from a {min(200, 200)}-trace sample per window.")
+    print(f"  Use changes as relative indicators — larger absolute deltas = bigger real spike.")
+    print()
+
+    # Sections
+    increased  = sorted([d for d in deltas if d["span_delta"] >= min_delta], key=lambda x: -x["span_delta"])
+    new_svcs   = [d for d in deltas if d["spans1"] == 0 and d["spans2"] > 0]
+    dropped    = sorted([d for d in deltas if d["span_delta"] <= -min_delta], key=lambda x: x["span_delta"])
+
+    if increased:
+        print("=" * 115)
+        print(f"  TOP SPAN INCREASES  (>={min_delta} span delta)  --  {len(increased)} service(s)")
+        print("=" * 115)
+        print(f"  {'Service':<35} {'Baseline':>9} {'Current':>9} {'Delta':>9} {'Change':>8}  "
+              f"{'ErrRate Baseline':>16} {'ErrRate Now':>12} {'Err Delta':>10}")
+        print("  " + "-" * 113)
+        for d in increased[:top_n]:
+            pct_str  = f"+{d['span_pct']:.1f}%" if d["spans1"] > 0 else "NEW"
+            base_str = f"{d['spans1']:,}" if d["spans1"] > 0 else "--"
+            err_arrow = " (+" if d["err_delta"] > 0 else " (-" if d["err_delta"] < 0 else "  "
+            err_str  = f"{err_arrow}{abs(d['err_delta']):.1f}pp)" if d["err_delta"] != 0 else ""
+            print(f"  {d['service']:<35} {base_str:>9} {d['spans2']:>9,} {d['span_delta']:>+9,} "
+                  f"{pct_str:>8}  {d['err_rate1']:>14.1f}%  {d['err_rate2']:>10.1f}%  "
+                  f"{d['err_delta']:>+8.1f}pp{err_str}")
+        print()
+
+    if show_new and new_svcs:
+        print("=" * 115)
+        print(f"  NEW SERVICES  (first seen in compared snapshot)  --  {len(new_svcs)} service(s)")
+        print("=" * 115)
+        print(f"  {'Service':<35} {'Spans':>9}  {'Err%':>8}")
+        print("  " + "-" * 56)
+        for d in sorted(new_svcs, key=lambda x: -x["spans2"])[:top_n]:
+            print(f"  {d['service']:<35} {d['spans2']:>9,}  {d['err_rate2']:>7.1f}%")
+        print()
+
+    if show_dropped and dropped:
+        print("=" * 115)
+        print(f"  BIGGEST SPAN DROPS  --  {len(dropped)} service(s)")
+        print("=" * 115)
+        print(f"  {'Service':<35} {'Baseline':>9} {'Current':>9} {'Delta':>9} {'Change':>8}")
+        print("  " + "-" * 75)
+        for d in dropped[:top_n]:
+            print(f"  {d['service']:<35} {d['spans1']:>9,} {d['spans2']:>9,} "
+                  f"{d['span_delta']:>+9,} {d['span_pct']:>+7.1f}%")
+        print()
+
+    if not increased and not new_svcs:
+        print(f"  No services exceeded the minimum span delta of {min_delta}.")
+        print(f"  Use --min-delta to lower the threshold or check the environment name.\n")
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -2096,6 +2475,40 @@ def main():
                            help="Hide the 'new metrics' section")
     p_compare.add_argument("--show-dropped", action="store_true",
                            help="Also show metrics that decreased most")
+
+    # trace-scan
+    p_tscan = sub.add_parser("trace-scan", help=(
+        "Snapshot current per-service trace/span volumes and save to history. "
+        "Run regularly to build history for trace-compare."
+    ))
+    p_tscan.add_argument("--environment", "-e", default=None,
+                         help="APM environment name (e.g. petclinicmbtest). Omit for all environments.")
+    p_tscan.add_argument("--lookback", type=float, default=1.0,
+                         help="Hours to look back for traces (default: 1)")
+    p_tscan.add_argument("--no-save", action="store_true",
+                         help="Print only, do not save snapshot to history")
+
+    # trace-compare
+    p_tcompare = sub.add_parser("trace-compare", help=(
+        "Compare per-service trace/span volumes between two dates to identify TAPM spikes. "
+        "Use 'now' for a live snapshot. Falls back to stored history when available."
+    ))
+    p_tcompare.add_argument("--date1", required=True,
+                            help="Baseline: 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM', or 'now'")
+    p_tcompare.add_argument("--date2", required=True,
+                            help="Comparison: 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM', or 'now'")
+    p_tcompare.add_argument("--environment", "-e", default=None,
+                            help="APM environment name to filter (recommended)")
+    p_tcompare.add_argument("--top", type=int, default=20,
+                            help="Max services to show per section (default: 20)")
+    p_tcompare.add_argument("--min-delta", type=int, default=10,
+                            help="Minimum span delta to include (default: 10)")
+    p_tcompare.add_argument("--lookback", type=float, default=1.0,
+                            help="Hours per window for live snapshots (default: 1)")
+    p_tcompare.add_argument("--no-new", action="store_true",
+                            help="Hide new services section")
+    p_tcompare.add_argument("--show-dropped", action="store_true",
+                            help="Also show services with biggest span decreases")
 
     args = parser.parse_args()
 
@@ -2198,6 +2611,25 @@ def main():
         print(f"  Reduction:   -{reduction_pct}%")
         if args.note:
             print(f"  Note: {args.note}")
+
+    elif args.command == "trace-scan":
+        cmd_scan_traces(
+            environment   = args.environment,
+            lookback_hours = args.lookback,
+            save          = not args.no_save,
+        )
+
+    elif args.command == "trace-compare":
+        cmd_compare_traces(
+            date1          = args.date1,
+            date2          = args.date2,
+            environment    = args.environment,
+            top_n          = args.top,
+            min_delta      = args.min_delta,
+            show_new       = not args.no_new,
+            show_dropped   = args.show_dropped,
+            lookback_hours = args.lookback,
+        )
 
     else:
         parser.print_help()
