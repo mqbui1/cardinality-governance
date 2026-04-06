@@ -24,7 +24,8 @@ High-cardinality metrics are the #1 cause of surprise overage bills in Splunk Ob
 8. **Duplicate metric grouping** — identifies metrics sharing the same high-cardinality dimension and groups metric families (e.g. `_bucket/_count/_sum/_min/_max` variants) — one fix resolves the whole group
 9. **Fix suggestion generator** — for each duplicate group, auto-generates ready-to-paste OTel Collector `transform` processor YAML with the exact `delete_key()` statement and metric allow-list scoped to only the affected metrics; includes a collapsible SHA256-hash alternative
 10. **Remediation tracking** — automatically detects when a metric's MTS drops >50% vs its historical peak and marks it resolved; supports manual `resolve` command; resolved findings appear at the top of the next report confirming the fix worked
-11. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
+11. **Cost estimation** — maps MTS count to estimated monthly cost (default `$0.002/MTS/mo`, configurable via `MTS_COST_PER_MONTH` env var); shown in report header, Top Offenders table, and per-service scorecard
+12. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
 
 ## Modes
 
@@ -175,7 +176,7 @@ Reports are saved to `reports/cardinality_report_<timestamp>.md` and include:
   - *By metric family*: `_bucket/_count/_sum/_min/_max/_total` variants grouped under their common root name, confirming they share the same problem dimension
 - **Fix suggestion YAML** — inline per group: ready-to-paste OTel Collector processor config to drop or hash the offending dimension (see below)
 - **Resolved findings** — metrics that previously exceeded thresholds and have since dropped >50% MTS; shown at the top of the report confirming the fix worked
-- **Detailed findings** — per-metric breakdown with dimension cardinality table and sample values
+- **Detailed findings** — per-metric breakdown with dimension cardinality table, estimated cost, and sample values
 - **AI remediation** (CRITICAL/HIGH only) — root cause, OTel Collector processor config, SignalFlow rollup, estimated MTS reduction
 
 ## Per-service cardinality scorecard
@@ -213,6 +214,27 @@ Combined MTS: 1,539 | Metrics in group: 5 | One fix resolves all 5
 ```
 #### Family: `http.client.request.duration_*`
 Combined MTS: 1,539 | Variants: 5 | Shared problem dimension: `server.address`
+```
+
+## Cost estimation
+
+MTS count is converted to an estimated monthly cost throughout the report. The default rate is **$0.002 per MTS per month** — a conservative mid-tier estimate for Splunk Observability Cloud custom metrics.
+
+Override the rate to match your org's actual contract:
+```bash
+export MTS_COST_PER_MONTH=0.005   # $0.005/MTS/mo (higher tier)
+python3 cardinality_governance.py report
+```
+
+Cost appears in three places:
+- **Report header** — total estimated cost across all findings
+- **Top Offenders table** — `Est. Cost/Mo` column per metric
+- **Per-Service Scorecard** — `Est. Cost/Mo` column per service
+
+Example header output:
+```
+Total MTS across findings: 2,500,000
+Estimated monthly cost (findings only): ~$5,000.00/mo (at $0.002/MTS/mo)
 ```
 
 ## Remediation tracking
