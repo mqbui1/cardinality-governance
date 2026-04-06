@@ -22,7 +22,8 @@ High-cardinality metrics are the #1 cause of surprise overage bills in Splunk Ob
 6. **Org limit awareness** — fetches org MTS limit and shows each finding's % contribution
 7. **Per-service scorecard** — ranks services/teams by total MTS contributed across all findings, showing ownership and % of total
 8. **Duplicate metric grouping** — identifies metrics sharing the same high-cardinality dimension and groups metric families (e.g. `_bucket/_count/_sum/_min/_max` variants) — one fix resolves the whole group
-9. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
+9. **Fix suggestion generator** — for each duplicate group, auto-generates ready-to-paste OTel Collector `transform` processor YAML with the exact `delete_key()` statement and metric allow-list scoped to only the affected metrics; includes a collapsible SHA256-hash alternative
+10. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
 
 ## Modes
 
@@ -166,6 +167,7 @@ Reports are saved to `reports/cardinality_report_<timestamp>.md` and include:
 - **Duplicate / similar metric groups** — two views:
   - *By shared worst dimension*: all metrics with the same offending dimension grouped together with combined MTS and "one fix resolves all N" callout
   - *By metric family*: `_bucket/_count/_sum/_min/_max/_total` variants grouped under their common root name, confirming they share the same problem dimension
+- **Fix suggestion YAML** — inline per group: ready-to-paste OTel Collector processor config to drop or hash the offending dimension (see below)
 - **Detailed findings** — per-metric breakdown with dimension cardinality table and sample values
 - **AI remediation** (CRITICAL/HIGH only) — root cause, OTel Collector processor config, SignalFlow rollup, estimated MTS reduction
 
@@ -205,3 +207,51 @@ Combined MTS: 1,539 | Metrics in group: 5 | One fix resolves all 5
 #### Family: `http.client.request.duration_*`
 Combined MTS: 1,539 | Variants: 5 | Shared problem dimension: `server.address`
 ```
+
+## Fix suggestion generator
+
+Every duplicate group in the report includes two ready-to-paste OTel Collector processor configs.
+
+**Option 1 — Drop the dimension entirely** (shown inline):
+```yaml
+# OTel Collector processor — drop `server.address` from 5 metric(s)
+# Dimension has 21 unique values (IP address)
+# Effect: eliminates the cardinality explosion; metric is still reported per remaining dimensions.
+processors:
+  transform/drop_server_address:
+    metric_statements:
+      - context: datapoint
+        statements:
+          - delete_key(attributes, "server.address")  # anti-pattern: IP address
+        # Apply only to these metrics (remove 'include' block to apply to all):
+        include:
+          match_type: strict
+          metric_names:
+            - 'http.client.request.duration_bucket'
+            - 'http.client.request.duration_count'
+            - 'http.client.request.duration_max'
+            - 'http.client.request.duration_min'
+            - 'http.client.request.duration_sum'
+
+service:
+  pipelines:
+    metrics:
+      processors: [transform/drop_server_address, ...]
+```
+
+**Option 2 — Hash instead of drop** (collapsible, use when cross-restart correlation is needed):
+```yaml
+processors:
+  transform/hash_server_address:
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(attributes["server.address"], SHA256(attributes["server.address"]))
+        include:
+          match_type: strict
+          metric_names:
+            - 'http.client.request.duration_bucket'
+            ...
+```
+
+Each processor is named `transform/drop_<dim>` or `transform/hash_<dim>` and scoped to only the affected metrics via `include.metric_names`, so it won't accidentally affect unrelated metrics that happen to share the same dimension name.
