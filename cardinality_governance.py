@@ -810,6 +810,13 @@ def generate_report(findings, use_claude=True):
     total_cost = total_mts * MTS_COST_PER_MONTH
     lines.append(f"**Estimated monthly cost (findings only):** ~${total_cost:,.2f}/mo *(at ${MTS_COST_PER_MONTH}/MTS/mo — override with `MTS_COST_PER_MONTH` env var)*")
 
+    # Savings summary from resolved findings
+    all_resolved = db_get_resolved()
+    if all_resolved:
+        saved_mts   = sum(r[1] - r[3] for r in all_resolved)   # peak_mts - resolved_mts
+        saved_cost  = saved_mts * MTS_COST_PER_MONTH
+        lines.append(f"**Cumulative savings (resolved findings):** {saved_mts:,} MTS / ~${saved_cost:,.2f}/mo saved across {len(all_resolved)} resolved metric(s) 🎉")
+
     # Org limit section
     org = fetch_org_info()
     mts_limit = org.get("mtsCategoryInfo", {}).get("mtsLimitThreshold") \
@@ -845,16 +852,22 @@ def generate_report(findings, use_claude=True):
     if resolved:
         lines.append(f"\n## Resolved Findings\n")
         lines.append(f"> These metrics previously exceeded severity thresholds and have since dropped >50% — fix confirmed working.\n")
-        lines.append(f"| Metric | Peak MTS | Current MTS | Reduction | Resolved At | How |")
-        lines.append(f"|--------|----------|-------------|-----------|-------------|-----|")
-        # Build a quick lookup of current MTS from findings
+        lines.append(f"| Metric | Peak MTS | Current MTS | MTS Saved | Cost Saved/Mo | Reduction | Resolved At | How |")
+        lines.append(f"|--------|----------|-------------|-----------|---------------|-----------|-------------|-----|")
         current_mts_map = {f["metric"]: f["mts_count"] for f in findings}
+        total_saved_mts  = 0
+        total_saved_cost = 0.0
         for row in resolved:
             metric, peak_mts, peak_at, resolved_mts, resolved_at, reduction_pct, manual = row
-            current = current_mts_map.get(metric, resolved_mts)
-            how = "manual" if manual else "auto-detected"
+            current      = current_mts_map.get(metric, resolved_mts)
+            mts_saved    = peak_mts - current
+            cost_saved   = mts_saved * MTS_COST_PER_MONTH
+            total_saved_mts  += mts_saved
+            total_saved_cost += cost_saved
+            how          = "manual" if manual else "auto"
             resolved_date = resolved_at[:10]
-            lines.append(f"| `{metric}` | {peak_mts:,} | {current:,} | -{reduction_pct}% | {resolved_date} | {how} |")
+            lines.append(f"| `{metric}` | {peak_mts:,} | {current:,} | {mts_saved:,} | ~${cost_saved:,.2f}/mo | -{reduction_pct}% | {resolved_date} | {how} |")
+        lines.append(f"\n**Total savings: {total_saved_mts:,} MTS / ~${total_saved_cost:,.2f}/mo** across {len(resolved)} resolved metric(s)")
         lines.append("")
 
     lines.append(f"\n## Top Offenders\n")
