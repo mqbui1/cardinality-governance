@@ -58,7 +58,8 @@ CARDINALITY_PATTERNS = [
 
 REPORTS_DIR  = Path("reports")
 STATE_DB     = Path("cardinality_state.db")
-TREND_GROWTH_WARN = 0.20   # flag if MTS grew >20% since last scan
+TREND_GROWTH_WARN   = 0.20   # flag if MTS grew >20% since last scan
+REMEDIATION_DROP_PCT = 0.50  # mark resolved if MTS dropped >50% vs peak
 
 # ---------------------------------------------------------------------------
 # API helpers
@@ -156,6 +157,19 @@ def db_connect():
             mts_count   INTEGER NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS remediations (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            realm         TEXT NOT NULL,
+            metric        TEXT NOT NULL,
+            peak_mts      INTEGER NOT NULL,
+            peak_at       TEXT NOT NULL,
+            resolved_mts  INTEGER NOT NULL,
+            resolved_at   TEXT NOT NULL,
+            reduction_pct REAL NOT NULL,
+            manual        INTEGER NOT NULL DEFAULT 0
+        )
+    """)
     conn.commit()
     return conn
 
@@ -200,6 +214,68 @@ def db_get_history(metric_name, limit=10):
     ).fetchall()
     conn.close()
     return rows
+
+
+def db_get_peak(metric_name):
+    """Return (peak_mts, scanned_at) — the highest MTS count ever seen for this metric."""
+    if not STATE_DB.exists():
+        return None, None
+    conn = db_connect()
+    row = conn.execute(
+        """SELECT mts_count, scanned_at FROM scans
+           WHERE realm=? AND metric=?
+           ORDER BY mts_count DESC LIMIT 1""",
+        (REALM, metric_name)
+    ).fetchone()
+    conn.close()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def db_mark_resolved(metric_name, peak_mts, peak_at, current_mts, manual=False):
+    """Record that a metric's cardinality has been successfully remediated."""
+    conn = db_connect()
+    ts = datetime.now(timezone.utc).isoformat()
+    reduction_pct = round((peak_mts - current_mts) / peak_mts * 100, 1)
+    conn.execute(
+        """INSERT INTO remediations
+               (realm, metric, peak_mts, peak_at, resolved_mts, resolved_at, reduction_pct, manual)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (REALM, metric_name, peak_mts, peak_at, current_mts, ts, reduction_pct, int(manual))
+    )
+    conn.commit()
+    conn.close()
+    return reduction_pct
+
+
+def db_get_resolved():
+    """Return all resolved findings for this realm, most recently resolved first."""
+    if not STATE_DB.exists():
+        return []
+    conn = db_connect()
+    rows = conn.execute(
+        """SELECT metric, peak_mts, peak_at, resolved_mts, resolved_at, reduction_pct, manual
+           FROM remediations
+           WHERE realm=?
+           ORDER BY resolved_at DESC""",
+        (REALM,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def db_is_resolved(metric_name):
+    """Return True if this metric has been marked resolved and hasn't re-exploded since."""
+    if not STATE_DB.exists():
+        return False
+    conn = db_connect()
+    row = conn.execute(
+        """SELECT resolved_at FROM remediations
+           WHERE realm=? AND metric=?
+           ORDER BY resolved_at DESC LIMIT 1""",
+        (REALM, metric_name)
+    ).fetchone()
+    conn.close()
+    return row is not None
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +610,16 @@ def scan_org(top_n=50, verbose=False):
             prev_ts    = None
             trend      = "NEW"
 
+        # Auto-remediation detection: check if MTS dropped >50% vs historical peak
+        peak_mts, peak_at = db_get_peak(name)
+        auto_resolved = False
+        if peak_mts and peak_mts > 0:
+            drop_pct = (peak_mts - mts_count) / peak_mts
+            if drop_pct >= REMEDIATION_DROP_PCT and not db_is_resolved(name):
+                db_mark_resolved(name, peak_mts, peak_at, mts_count, manual=False)
+                auto_resolved = True
+                print(f"  [RESOLVED] {name}: {peak_mts:,} → {mts_count:,} MTS (-{int(drop_pct*100)}%)")
+
         # MTS limit % contribution
         limit_pct = round(mts_count / mts_limit * 100, 2) if mts_limit else None
 
@@ -569,6 +655,9 @@ def scan_org(top_n=50, verbose=False):
             "growth_pct":     growth_pct,
             "trend":          trend,
             "limit_pct":      limit_pct,
+            "auto_resolved":  auto_resolved,
+            "peak_mts":       peak_mts,
+            "peak_at":        peak_at,
         })
 
     # Sort by MTS count descending
@@ -733,6 +822,23 @@ def generate_report(findings, use_claude=True):
             for f in growing:
                 pct = int(f["growth_pct"] * 100)
                 lines.append(f"  - `{f['metric']}`: {f['prev_count']:,} → {f['mts_count']:,} MTS (+{pct}%)")
+
+    # Resolved findings section
+    resolved = db_get_resolved()
+    if resolved:
+        lines.append(f"\n## Resolved Findings\n")
+        lines.append(f"> These metrics previously exceeded severity thresholds and have since dropped >50% — fix confirmed working.\n")
+        lines.append(f"| Metric | Peak MTS | Current MTS | Reduction | Resolved At | How |")
+        lines.append(f"|--------|----------|-------------|-----------|-------------|-----|")
+        # Build a quick lookup of current MTS from findings
+        current_mts_map = {f["metric"]: f["mts_count"] for f in findings}
+        for row in resolved:
+            metric, peak_mts, peak_at, resolved_mts, resolved_at, reduction_pct, manual = row
+            current = current_mts_map.get(metric, resolved_mts)
+            how = "manual" if manual else "auto-detected"
+            resolved_date = resolved_at[:10]
+            lines.append(f"| `{metric}` | {peak_mts:,} | {current:,} | -{reduction_pct}% | {resolved_date} | {how} |")
+        lines.append("")
 
     lines.append(f"\n## Top Offenders\n")
     lines.append(f"| Rank | Metric | MTS Count | % of Limit | Trend | Severity | Instrumentation Source | Worst Dimension | Attributed To |")
@@ -1032,6 +1138,11 @@ def main():
     p_rollup = sub.add_parser("rollup", help="Generate rollup suggestions for a specific metric")
     p_rollup.add_argument("--metric", required=True, help="Metric name to analyze")
 
+    # resolve
+    p_resolve = sub.add_parser("resolve", help="Manually mark a metric as remediated")
+    p_resolve.add_argument("--metric", required=True, help="Metric name to mark resolved")
+    p_resolve.add_argument("--note", default="", help="Optional note (e.g. 'applied delete_key fix in collector v1.2')")
+
     args = parser.parse_args()
 
     if not TOKEN:
@@ -1069,6 +1180,24 @@ def main():
 
     elif args.command == "rollup":
         suggest_rollup(args.metric)
+
+    elif args.command == "resolve":
+        mts_list = fetch_mts_for_metric(args.metric, limit=100)
+        current_mts = len(mts_list)
+        peak_mts, peak_at = db_get_peak(args.metric)
+        if peak_mts is None:
+            print(f"No scan history found for '{args.metric}'. Run 'scan' first.")
+            sys.exit(1)
+        if db_is_resolved(args.metric):
+            print(f"'{args.metric}' is already marked resolved.")
+            sys.exit(0)
+        reduction_pct = db_mark_resolved(args.metric, peak_mts, peak_at, current_mts, manual=True)
+        print(f"Marked '{args.metric}' as resolved.")
+        print(f"  Peak MTS:    {peak_mts:,} (at {peak_at[:10]})")
+        print(f"  Current MTS: {current_mts:,}")
+        print(f"  Reduction:   -{reduction_pct}%")
+        if args.note:
+            print(f"  Note: {args.note}")
 
     else:
         parser.print_help()
