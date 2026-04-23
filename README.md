@@ -510,7 +510,58 @@ Trend over 7 scans: DOWN 21.3%  (-2,650 MTS / ~-$5.30/mo)
 python3 cardinality_governance.py report --format html --no-ai
 ```
 
-Self-contained `.html` file with six sortable-table tabs: Top Offenders, Service Scorecard, Duplicate Groups (with collapsible fix YAML), Resolved, Detailed Findings, Ignored.
+Self-contained `.html` file. Sections:
+
+| Section | Contents |
+|---------|----------|
+| Executive Summary | Governance grade (A–F), score/100, key signals at a glance |
+| Recommended Actions | Prioritised action list (critical → low) with category and detail |
+| Overview | Stat grid (critical/high/medium/MTS/cost/savings) + alert banners |
+| Top Offenders | Sortable table: metric, MTS, cost, severity, trend, source, worst dimension, services |
+| Per-Service Scorecard | MTS and cost attributed per service with % bar |
+| Duplicate / Similar Groups | Metrics sharing the same high-cardinality dimension — collapsible OTel Collector YAML fix |
+| Resolved Findings | Peak vs current MTS, savings, how (auto/manual) |
+| Detailed Findings | Per-metric collapsible: dimension table, anti-pattern detection, AI remediation |
+| Scan History | MTS/cost/severity trend across past scans |
+| Ignored Patterns | Active glob patterns suppressed from reports |
+
+**Report features:**
+- Sidebar navigation with search — jump to any section instantly
+- Sticky summary bar — grade, MTS total, critical/growing counts always visible
+- Dark / light mode toggle
+- Sortable tables (click any column header)
+- Print-friendly layout
+- Collapsible sections — expand/collapse each card
+
+**Sample layout:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ [sticky bar]  C  45/100  |  3 critical  2 high  |  15,250 MTS  ~$30.50/mo  │
+├──────────┬──────────────────────────────────────────────────────────────────┤
+│ Sections │  Splunk Observability — Cardinality Governance          [🌙][🖨] │
+│          │  realm=us1 | generated 2026-04-23 | 48 metrics analyzed          │
+│ Overview │                                                                   │
+│ Actions  │  ┌─ C  45/100 ─────────────────────────────────────────────────┐ │
+│ Offend.  │  │  3 Critical  2 High  3 Medium  ·  15,250 MTS  ·  ~$30.50/mo │ │
+│ Scorecard│  │  ▲ 2 growing  ·  1 anomaly                                   │ │
+│ Groups   │  │  [critical] Fix CRITICAL metric: http.client.request.duration │ │
+│ Resolved │  └──────────────────────────────────────────────────────────────┘ │
+│ Details  │                                                                   │
+│ History  │  ▼ Recommended Actions                                            │
+│ Ignored  │    critical  Cardinality  Fix CRITICAL: http.client.request...   │
+│          │    high      Trend        2 metrics growing >20%                  │
+│          │    high      Anomaly      1 metric above 7-day baseline           │
+│          │                                                                   │
+│          │  ▼ Overview                                                       │
+│          │    3 CRIT  2 HIGH  3 MED  |  15,250 MTS  |  ~$30.50/mo          │
+│          │                                                                   │
+│          │  ▼ Top Offenders (sortable)                                       │
+│          │    #  Metric                     MTS    Cost    Sev   Trend       │
+│          │    1  http.client.req.duration  12,500  $25.00  CRIT  GROWING    │
+│          │    2  k8s.pod.phase              2,100   $4.20  HIGH  STABLE     │
+└──────────┴───────────────────────────────────────────────────────────────────┘
+```
 
 ### Watch mode
 
