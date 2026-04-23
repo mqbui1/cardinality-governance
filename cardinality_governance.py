@@ -1233,7 +1233,7 @@ def _trend_badge(trend, growth_pct=None):
 
 
 def generate_html_report(findings, use_claude=True):
-    """Generate a self-contained HTML report with sortable tables and collapsible sections."""
+    """Generate a self-contained HTML report matching the o11y-adoption design."""
     REPORTS_DIR.mkdir(exist_ok=True)
     ts      = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     outpath = REPORTS_DIR / f"cardinality_report_{ts}.html"
@@ -1254,156 +1254,56 @@ def generate_html_report(findings, use_claude=True):
     saved_mts  = sum(r[1] - r[3] for r in all_resolved) if all_resolved else 0
     saved_cost = saved_mts * MTS_COST_PER_MONTH
 
-    growing = [f for f in findings if f.get("trend") == "GROWING"]
+    growing     = [f for f in findings if f.get("trend") == "GROWING"]
     new_metrics = [f for f in findings if f.get("trend") == "NEW"]
+    anomalies   = [f for f in findings if f.get("anomaly")]
 
-    # ---- CSS + JS ----
-    css = """
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-           background: #f6f8fa; color: #24292e; line-height: 1.5; }
-    .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
-    h1 { font-size: 1.8rem; margin-bottom: 4px; }
-    h2 { font-size: 1.3rem; margin: 28px 0 12px; border-bottom: 2px solid #e1e4e8; padding-bottom: 6px; }
-    h3 { font-size: 1.1rem; margin: 20px 0 8px; color: #444; }
-    .meta { color: #586069; font-size: 0.9rem; margin-bottom: 20px; }
-    .cards { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }
-    .card { background: #fff; border: 1px solid #e1e4e8; border-radius: 8px;
-            padding: 16px 20px; min-width: 160px; flex: 1; }
-    .card .value { font-size: 1.8rem; font-weight: 700; }
-    .card .label { font-size: 0.8rem; color: #586069; text-transform: uppercase; letter-spacing: .05em; }
-    .card.red   { border-top: 4px solid #d73a49; }
-    .card.orange{ border-top: 4px solid #e36209; }
-    .card.yellow{ border-top: 4px solid #b08800; }
-    .card.green { border-top: 4px solid #28a745; }
-    .card.blue  { border-top: 4px solid #0366d6; }
-    table { width: 100%; border-collapse: collapse; background: #fff;
-            border: 1px solid #e1e4e8; border-radius: 8px; overflow: hidden;
-            font-size: 0.875rem; margin-bottom: 20px; }
-    th { background: #f6f8fa; padding: 10px 12px; text-align: left;
-         border-bottom: 2px solid #e1e4e8; white-space: nowrap; cursor: pointer; user-select: none; }
-    th:hover { background: #eaecef; }
-    th.sort-asc::after  { content: " ▲"; font-size: 0.7em; }
-    th.sort-desc::after { content: " ▼"; font-size: 0.7em; }
-    td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; vertical-align: top; }
-    tr:last-child td { border-bottom: none; }
-    tr:hover td { background: #f9fafb; }
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px;
-             font-size: 0.75rem; font-weight: 600; color: #fff; white-space: nowrap; }
-    .metric-name { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.82rem; }
-    .dim-name    { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.82rem;
-                   background: #f3f4f6; padding: 1px 5px; border-radius: 4px; }
-    details { margin: 8px 0; }
-    summary { cursor: pointer; font-weight: 600; color: #0366d6; padding: 6px 0; }
-    summary:hover { text-decoration: underline; }
-    pre { background: #1e2030; color: #cdd6f4; padding: 14px 16px; border-radius: 6px;
-          font-size: 0.8rem; overflow-x: auto; white-space: pre; margin: 8px 0; }
-    .alert { background: #fff8c5; border: 1px solid #f0c000; border-radius: 6px;
-             padding: 10px 14px; margin-bottom: 12px; font-size: 0.9rem; }
-    .alert.green { background: #dcffe4; border-color: #28a745; }
-    .alert.red   { background: #ffeef0; border-color: #d73a49; }
-    .group-box { background: #fff; border: 1px solid #e1e4e8; border-radius: 8px;
-                 padding: 16px; margin-bottom: 16px; }
-    .group-box h4 { font-size: 1rem; margin-bottom: 8px; }
-    .savings-banner { background: #dcffe4; border: 1px solid #28a745; border-radius: 8px;
-                      padding: 12px 16px; margin-bottom: 20px; font-size: 1rem; }
-    .tab-nav { display: flex; gap: 4px; border-bottom: 2px solid #e1e4e8; margin-bottom: 20px; }
-    .tab-btn { padding: 8px 16px; cursor: pointer; border: none; background: none;
-               font-size: 0.9rem; color: #586069; border-bottom: 3px solid transparent;
-               margin-bottom: -2px; font-weight: 500; }
-    .tab-btn.active { color: #0366d6; border-bottom-color: #0366d6; }
-    .tab-pane { display: none; }
-    .tab-pane.active { display: block; }
-    @media (max-width: 768px) { .cards { flex-direction: column; } }
-    """
+    # Health grade: penalise weighted by log10(mts_count) so large explosions hurt more
+    import math as _math
+    def _penalty(finding_list, flat):
+        return sum(flat * max(1.0, _math.log10(max(1, f["mts_count"]))) for f in finding_list)
+    _score = 100
+    _score -= _penalty(critical, 6)
+    _score -= _penalty(high,     3)
+    _score -= _penalty(medium,   1)
+    _score -= _penalty(growing,  2)
+    health_score = max(0, min(100, round(_score)))
+    grade        = "A" if health_score >= 80 else "B" if health_score >= 65 else "C" if health_score >= 50 else "D" if health_score >= 35 else "F"
+    grade_color  = {"A": "#22c55e", "B": "#84cc16", "C": "#eab308", "D": "#f97316", "F": "#ef4444"}[grade]
 
-    js = """
-    // Tab switching
-    function showTab(id) {
-        document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-        document.getElementById(id).classList.add('active');
-        event.target.classList.add('active');
-    }
-
-    // Table sorting
-    document.querySelectorAll('th[data-sort]').forEach(th => {
-        th.addEventListener('click', () => {
-            const table = th.closest('table');
-            const col   = Array.from(th.parentElement.children).indexOf(th);
-            const asc   = th.classList.toggle('sort-asc');
-            th.classList.toggle('sort-desc', !asc);
-            th.parentElement.querySelectorAll('th').forEach(t => {
-                if (t !== th) { t.classList.remove('sort-asc', 'sort-desc'); }
-            });
-            const tbody = table.querySelector('tbody');
-            const rows  = Array.from(tbody.querySelectorAll('tr'));
-            rows.sort((a, b) => {
-                const av = a.cells[col]?.dataset.val ?? a.cells[col]?.textContent ?? '';
-                const bv = b.cells[col]?.dataset.val ?? b.cells[col]?.textContent ?? '';
-                const an = parseFloat(av), bn = parseFloat(bv);
-                if (!isNaN(an) && !isNaN(bn)) return asc ? an - bn : bn - an;
-                return asc ? av.localeCompare(bv) : bv.localeCompare(av);
-            });
-            rows.forEach(r => tbody.appendChild(r));
-        });
-    });
-    """
-
-    # ---- Build HTML sections ----
-    def stat_card(value, label, cls="blue"):
-        return f'<div class="card {cls}"><div class="value">{_h(value)}</div><div class="label">{_h(label)}</div></div>'
-
-    # Header cards
-    cards_html = '<div class="cards">'
-    cards_html += stat_card(f"{total_mts:,}", "Total MTS", "red" if critical else "orange")
-    cards_html += stat_card(f"~${total_cost:,.2f}", "Est. Cost / Mo", "orange")
-    cards_html += stat_card(str(len(critical)), "Critical", "red")
-    cards_html += stat_card(str(len(high)), "High", "orange")
-    cards_html += stat_card(str(len(medium)), "Medium", "yellow")
-    if saved_mts:
-        cards_html += stat_card(f"~${saved_cost:,.2f}", "Saved / Mo", "green")
-    if pct_used is not None:
-        cards_html += stat_card(f"{pct_used}%", "% of Org Limit", "blue")
-    cards_html += "</div>"
-
-    # Alerts
-    alerts_html = ""
-    if growing:
-        names = ", ".join(f"<code>{_h(f['metric'])}</code>" for f in growing[:3])
-        alerts_html += f'<div class="alert red">📈 <strong>{len(growing)} metric(s) growing &gt;20%</strong> since last scan: {names}{"..." if len(growing) > 3 else ""}</div>'
-    if new_metrics:
-        alerts_html += f'<div class="alert">🆕 <strong>{len(new_metrics)} new metric(s)</strong> appeared since last scan</div>'
-    if saved_mts:
-        alerts_html += f'<div class="alert green">🎉 <strong>Cumulative savings:</strong> {saved_mts:,} MTS / ~${saved_cost:,.2f}/mo across {len(all_resolved)} resolved metric(s)</div>'
-
-    # Top offenders table
-    def offenders_table(rows, limit=None):
-        h = '<table><thead><tr>'
-        h += '<th data-sort>Rank</th><th data-sort>Metric</th><th data-sort>MTS</th>'
-        h += '<th data-sort>Est. Cost/Mo</th><th data-sort>Severity</th>'
-        h += '<th data-sort>Trend</th><th data-sort>Source</th>'
-        h += '<th data-sort>Worst Dimension</th><th>Services</th></tr></thead><tbody>'
-        for i, f in enumerate(rows[:limit] if limit else rows, 1):
-            worst = f["worst_dim"] or "—"
-            worst_count = f["worst_dim_info"]["unique_values"] if f["worst_dim_info"] else 0
-            services = ", ".join(f["attributed_to"][:2])
+    # Recommended actions
+    def _recommended_actions():
+        actions = []
+        for f in critical[:5]:
             cost = f["mts_count"] * MTS_COST_PER_MONTH
-            h += f'<tr>'
-            h += f'<td data-val="{i}">{i}</td>'
-            h += f'<td><span class="metric-name">{_h(f["metric"])}</span></td>'
-            h += f'<td data-val="{f["mts_count"]}">{f["mts_count"]:,}</td>'
-            h += f'<td data-val="{cost}">~${cost:,.2f}</td>'
-            h += f'<td>{_sev_badge(f["severity"])}</td>'
-            h += f'<td>{_trend_badge(f.get("trend",""), f.get("growth_pct"))}</td>'
-            h += f'<td>{_h(f["instr_source"])}</td>'
-            h += f'<td><span class="dim-name">{_h(worst)}</span> ({worst_count:,})</td>'
-            h += f'<td>{_h(services)}</td>'
-            h += '</tr>'
-        h += '</tbody></table>'
-        return h
+            actions.append({"priority": "critical", "category": "Cardinality",
+                            "action": f"Fix CRITICAL metric: {f['metric']}",
+                            "detail": f"{f['mts_count']:,} MTS · ~${cost:,.2f}/mo · worst dim: {f['worst_dim'] or '?'}"})
+        if growing:
+            actions.append({"priority": "high", "category": "Trend",
+                            "action": f"Investigate {len(growing)} metric(s) growing >20%",
+                            "detail": ", ".join(f["metric"] for f in growing[:3])})
+        if anomalies:
+            actions.append({"priority": "high", "category": "Anomaly",
+                            "action": f"{len(anomalies)} metric(s) growing faster than 7-day baseline",
+                            "detail": ", ".join(f["metric"] for f in anomalies[:3])})
+        for f in high[:3]:
+            actions.append({"priority": "high", "category": "Cardinality",
+                            "action": f"Remediate HIGH metric: {f['metric']}",
+                            "detail": f"{f['mts_count']:,} MTS · worst dim: {f['worst_dim'] or '?'}"})
+        if pct_used and pct_used > 80:
+            actions.append({"priority": "critical", "category": "Capacity",
+                            "action": f"Org MTS at {pct_used}% of limit — immediate action required",
+                            "detail": f"{total_mts:,} / {mts_limit:,} MTS"})
+        if medium:
+            actions.append({"priority": "medium", "category": "Cardinality",
+                            "action": f"Plan remediation for {len(medium)} MEDIUM metric(s)",
+                            "detail": "Address in next sprint"})
+        return actions
 
-    # Service scorecard
+    actions = _recommended_actions()
+
+    # Service scorecard (computed early, used in multiple sections)
     service_mts     = defaultdict(int)
     service_metrics = defaultdict(set)
     for f in findings:
@@ -1411,42 +1311,423 @@ def generate_html_report(findings, use_claude=True):
             service_mts[svc]     += f["mts_count"]
             service_metrics[svc].add(f["metric"])
 
+    # Scan history for trend section
+    scan_history = db_get_scan_history(limit=10)
+
+    # ---- CSS ----
+    css = """
+    :root {
+      --bg: #f1f5f9; --surface: #fff; --border: #e2e8f0; --text: #1e293b;
+      --muted: #64748b; --subtle: #94a3b8; --hover: #f8fafc; --input-bg: #fff;
+    }
+    [data-theme="dark"] {
+      --bg: #0f172a; --surface: #1e293b; --border: #334155; --text: #f1f5f9;
+      --muted: #94a3b8; --subtle: #64748b; --hover: #273549; --input-bg: #1e293b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: var(--bg); color: var(--text); font-size: 14px; transition: background .2s, color .2s; }
+    .layout { display: flex; gap: 0; min-height: 100vh; }
+    .sidebar {
+      width: 220px; min-width: 220px; background: var(--surface); border-right: 1px solid var(--border);
+      padding: 16px 12px; position: sticky; top: 0; height: 100vh; overflow-y: auto;
+      font-size: 12px; flex-shrink: 0;
+    }
+    .sidebar h3 { font-size: 10px; font-weight: 700; text-transform: uppercase;
+                  letter-spacing: .08em; color: var(--subtle); margin: 12px 0 4px; }
+    .sidebar a { display: block; padding: 4px 8px; border-radius: 6px; color: var(--muted);
+                 text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sidebar a:hover { background: var(--hover); color: var(--text); }
+    .page { flex: 1; max-width: 1100px; padding: 24px; padding-top: 52px; }
+    header { background: linear-gradient(135deg,#0f172a,#1e3a5f);
+             color: #fff; border-radius: 12px; padding: 24px 28px; margin-bottom: 20px;
+             display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+    header h1 { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+    header p  { font-size: 12px; color: #94a3b8; }
+    .header-controls { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+    .card { background: var(--surface); border-radius: 12px; border: 1px solid var(--border);
+            padding: 20px 24px; margin-bottom: 16px; }
+    .card summary { outline: none; list-style: none; }
+    .card summary::-webkit-details-marker { display: none; }
+    .card[open] .toggle-icon::before { content: "▲"; }
+    .card:not([open]) .toggle-icon::before { content: "▼"; }
+    .card-title { font-size: 13px; font-weight: 700; text-transform: uppercase;
+                  letter-spacing: .05em; color: var(--muted); }
+    .card h2 { font-size: 13px; font-weight: 700; text-transform: uppercase;
+               letter-spacing: .05em; color: var(--muted); margin-bottom: 14px;
+               padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+    .stat-grid { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 4px; }
+    .stat { background: var(--hover); border: 1px solid var(--border); border-radius: 8px;
+            padding: 12px 18px; text-align: center; min-width: 110px; }
+    .stat .val { font-size: 26px; font-weight: 800; color: var(--text); }
+    .stat .lbl { font-size: 10px; color: var(--subtle); margin-top: 2px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { background: var(--hover); color: var(--muted); font-size: 10px; font-weight: 600;
+         text-transform: uppercase; letter-spacing: .05em;
+         padding: 7px 10px; text-align: left; border-bottom: 2px solid var(--border);
+         cursor: pointer; user-select: none; white-space: nowrap; }
+    th:hover { background: var(--border); }
+    th.sort-asc::after  { content: " ▲"; font-size: 0.7em; }
+    th.sort-desc::after { content: " ▼"; font-size: 0.7em; }
+    td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; color: var(--text); }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: var(--hover); }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px;
+             font-size: 0.75rem; font-weight: 600; color: #fff; white-space: nowrap; }
+    .metric-name { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.82rem; white-space: nowrap; }
+    .dim-name    { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.82rem;
+                   background: var(--hover); padding: 1px 5px; border-radius: 4px; border: 1px solid var(--border); }
+    details.finding { margin: 6px 0; }
+    details.finding > summary { cursor: pointer; font-weight: 600; color: #3b82f6; padding: 6px 0; }
+    details.finding > summary:hover { text-decoration: underline; }
+    pre { background: #1e2030; color: #cdd6f4; padding: 14px 16px; border-radius: 6px;
+          font-size: 0.8rem; overflow-x: auto; white-space: pre; margin: 8px 0; }
+    .group-box { background: var(--hover); border: 1px solid var(--border); border-radius: 8px;
+                 padding: 16px; margin-bottom: 16px; }
+    .group-box h4 { font-size: 13px; margin-bottom: 8px; }
+    details[id], .card[id] { scroll-margin-top: 52px; }
+    .col-extra { display: none; }
+    .show-extra .col-extra { display: table-cell; }
+    .btn-expand-cols {
+      font-size: 11px; padding: 3px 10px; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--hover); color: var(--muted); cursor: pointer; margin-bottom: 8px;
+    }
+    .btn-expand-cols:hover { background: var(--border); }
+    .copy-yaml-btn {
+      float: right; font-size: 10px; padding: 2px 8px; border-radius: 5px; border: 1px solid var(--border);
+      background: var(--hover); color: var(--muted); cursor: pointer; margin-left: 8px;
+    }
+    .copy-yaml-btn:hover { background: var(--border); color: var(--text); }
+    .savings-bar { height: 8px; border-radius: 4px; background: #22c55e; display: inline-block; min-width: 2px; }
+    #search-box {
+      width: 100%; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px;
+      font-size: 12px; background: var(--input-bg); color: var(--text); margin-bottom: 8px;
+    }
+    .search-hide { display: none !important; }
+    .btn-toggle {
+      background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.3);
+      color: #fff; border-radius: 8px; padding: 5px 12px; font-size: 12px;
+      cursor: pointer; white-space: nowrap;
+    }
+    .btn-toggle:hover { background: rgba(255,255,255,.25); }
+    #sticky-bar {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 999;
+      background: #0f172a; color: #fff; padding: 6px 20px;
+      display: flex; align-items: center; gap: 20px; font-size: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.3); transition: transform .2s;
+    }
+    #sticky-bar.hidden { transform: translateY(-100%); }
+    #sticky-bar .sb-grade { font-size:18px; font-weight:900; }
+    #sticky-bar .sb-sep   { color: #475569; }
+    #sticky-bar .sb-risk  { background:#ef4444; border-radius:6px; padding:2px 8px; font-size:11px; font-weight:700; }
+    #sticky-bar .sb-warn  { background:#f97316; border-radius:6px; padding:2px 8px; font-size:11px; font-weight:700; }
+    #sticky-bar .sb-close { margin-left:auto; cursor:pointer; color:#94a3b8; font-size:16px; line-height:1; }
+    @media (max-width: 768px) { .sidebar { display: none; } .layout { display: block; } #sticky-bar { display: none; } }
+    @media print {
+      body { background: #fff; color: #000; font-size: 11px; }
+      .sidebar, .header-controls, #search-box, #sticky-bar { display: none !important; }
+      .layout { display: block; }
+      .page { max-width: 100%; padding: 0; }
+      .card { break-inside: avoid; border: 1px solid #ccc; margin-bottom: 10px; box-shadow: none; }
+      header { background: #0f172a; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      details.card { display: block; }
+      details.card summary { display: none; }
+      th { background: #eee; }
+      tr:hover td { background: transparent; }
+    }
+    """
+
+    # ---- JS ----
+    js = """
+    function toggleDark() {
+      const html = document.documentElement;
+      html.dataset.theme = html.dataset.theme === 'dark' ? 'light' : 'dark';
+    }
+    function toggleExtraCols(btn, tableId) {
+      const tbl = document.getElementById(tableId);
+      if (!tbl) return;
+      const showing = tbl.classList.toggle('show-extra');
+      btn.textContent = showing ? 'Hide columns ▲' : 'Show more columns ▼';
+    }
+    function copyYaml(btn, text) {
+      navigator.clipboard.writeText(text).then(() => {
+        const orig = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => btn.textContent = orig, 1500);
+      }).catch(() => {
+        const ta = document.createElement('textarea');
+        ta.value = text; document.body.appendChild(ta);
+        ta.select(); document.execCommand('copy');
+        document.body.removeChild(ta);
+        const orig = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => btn.textContent = orig, 1500);
+      });
+    }
+    function filterReport(q) {
+      q = q.toLowerCase();
+      document.querySelectorAll('.card[id]').forEach(el => {
+        el.classList.toggle('search-hide', q && !el.textContent.toLowerCase().includes(q));
+      });
+    }
+    // Build sidebar nav from card anchors
+    document.addEventListener('DOMContentLoaded', () => {
+      const nav = document.getElementById('nav-links');
+      document.querySelectorAll('.card[id]').forEach(el => {
+        const title = el.querySelector('.card-title, h2, summary');
+        if (!title) return;
+        const a = document.createElement('a');
+        a.href = '#' + el.id;
+        a.textContent = title.textContent.replace(/[▲▼]/g,'').trim();
+        nav.appendChild(a);
+      });
+    });
+    // Table sorting
+    document.addEventListener('click', e => {
+      const th = e.target.closest('th[data-sort]');
+      if (!th) return;
+      const table = th.closest('table');
+      const col   = Array.from(th.parentElement.children).indexOf(th);
+      const asc   = th.classList.toggle('sort-asc');
+      th.classList.toggle('sort-desc', !asc);
+      th.parentElement.querySelectorAll('th').forEach(t => {
+        if (t !== th) t.classList.remove('sort-asc','sort-desc');
+      });
+      const tbody = table.querySelector('tbody');
+      Array.from(tbody.querySelectorAll('tr'))
+        .sort((a, b) => {
+          const av = a.cells[col]?.dataset.val ?? a.cells[col]?.textContent ?? '';
+          const bv = b.cells[col]?.dataset.val ?? b.cells[col]?.textContent ?? '';
+          const an = parseFloat(av), bn = parseFloat(bv);
+          if (!isNaN(an) && !isNaN(bn)) return asc ? an-bn : bn-an;
+          return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+        })
+        .forEach(r => tbody.appendChild(r));
+    });
+    """
+
+    # ---- Build HTML sections ----
+
+    def _card(title, body, anchor="", border_color=None, open_by_default=True):
+        border_style = f"border-left:4px solid {border_color};" if border_color else ""
+        anchor_attr  = f' id="{anchor}"' if anchor else ""
+        open_attr    = " open" if open_by_default else ""
+        return (f'<details class="card" style="{border_style}"{anchor_attr}{open_attr}>'
+                f'<summary style="display:flex;justify-content:space-between;align-items:center;cursor:pointer">'
+                f'<span class="card-title">{title}</span>'
+                f'<span class="toggle-icon" style="font-size:10px;color:var(--subtle)"></span>'
+                f'</summary>'
+                f'<div class="card-body" style="margin-top:14px">{body}</div>'
+                f'</details>')
+
+    # Executive summary
+    def _exec_summary():
+        top_actions = actions[:3]
+        action_items = ""
+        pc = {"critical": "#ef4444", "high": "#f97316", "medium": "#eab308", "low": "#22c55e"}
+        for a in top_actions:
+            c = pc.get(a["priority"], "#94a3b8")
+            action_items += (f'<li style="margin-bottom:6px">'
+                             f'<span style="background:{c};color:#fff;padding:1px 7px;border-radius:8px;font-size:10px;margin-right:6px">{a["priority"]}</span>'
+                             f'<strong>{_h(a["action"])}</strong>'
+                             + (f'<br><span style="font-size:11px;color:var(--muted);margin-left:52px">{_h(a["detail"])}</span>' if a.get("detail") else "")
+                             + '</li>')
+        trend_bits = []
+        if growing:
+            trend_bits.append(f'<span style="font-weight:700;color:#ef4444">▲ {len(growing)} growing</span>')
+        if anomalies:
+            trend_bits.append(f'<span style="font-weight:700;color:#f97316">{len(anomalies)} anomalies</span>')
+        if saved_mts:
+            trend_bits.append(f'<span style="font-weight:700;color:#22c55e">~${saved_cost:,.0f}/mo saved</span>')
+        trend_html = " &nbsp;·&nbsp; ".join(trend_bits) if trend_bits else ""
+        limit_html = (f'<span style="font-size:12px;color:var(--muted)">{pct_used}% of org MTS limit</span>'
+                      if pct_used is not None else "")
+        return f"""
+  <div class="card" style="border-left:6px solid {grade_color};background:linear-gradient(135deg,var(--hover) 0%,var(--surface) 100%);margin-bottom:16px">
+    <div style="display:flex;align-items:center;gap:24px;flex-wrap:wrap">
+      <div style="text-align:center;min-width:80px">
+        <div style="font-size:56px;font-weight:900;line-height:1;color:{grade_color}">{grade}</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px">Governance Score</div>
+        <div style="font-size:22px;font-weight:700;color:{grade_color}">{health_score}/100</div>
+      </div>
+      <div style="flex:1;min-width:200px">
+        <div style="font-size:13px;color:var(--muted);margin-bottom:6px">
+          <strong style="color:#ef4444">{len(critical)}</strong> Critical &nbsp;·&nbsp;
+          <strong style="color:#f97316">{len(high)}</strong> High &nbsp;·&nbsp;
+          <strong style="color:#eab308">{len(medium)}</strong> Medium &nbsp;·&nbsp;
+          <strong>{total_mts:,}</strong> total MTS &nbsp;·&nbsp;
+          <strong>~${total_cost:,.2f}/mo</strong>
+        </div>
+        <div style="margin-bottom:10px">{trend_html} {limit_html}</div>
+        {"<ul style='margin:0;padding-left:0;list-style:none'>" + action_items + "</ul>" if action_items else ""}
+      </div>
+    </div>
+  </div>"""
+
+    # Recommended actions card
+    def _actions_card():
+        if not actions:
+            return ""
+        pc = {"critical": "#ef4444", "high": "#f97316", "medium": "#eab308", "low": "#22c55e"}
+        rows = ""
+        for a in actions:
+            c = pc.get(a["priority"], "#94a3b8")
+            rows += (f'<tr>'
+                     f'<td style="text-align:center"><span style="background:{c};color:#fff;padding:2px 8px;border-radius:9px;font-size:11px">{_h(a["priority"])}</span></td>'
+                     f'<td style="font-size:12px;color:var(--muted)">{_h(a["category"])}</td>'
+                     f'<td style="font-size:13px;font-weight:600">{_h(a["action"])}</td>'
+                     f'<td style="font-size:11px;color:var(--muted)">{_h(a.get("detail",""))}</td>'
+                     f'</tr>')
+        body = f'<table><thead><tr><th style="text-align:center">Priority</th><th>Category</th><th>Action</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table>'
+        return _card("Recommended Actions", body, anchor="sec-actions",
+                     border_color="#ef4444" if any(a["priority"]=="critical" for a in actions) else "#f97316")
+
+    # Stat grid
+    def _stat_grid():
+        crit_c  = "#ef4444" if critical else "#94a3b8"
+        high_c  = "#f97316" if high     else "#94a3b8"
+        med_c   = "#eab308" if medium   else "#94a3b8"
+        html  = '<div class="stat-grid">'
+        html += f'<div class="stat"><div class="val" style="color:{crit_c}">{len(critical)}</div><div class="lbl">Critical</div></div>'
+        html += f'<div class="stat"><div class="val" style="color:{high_c}">{len(high)}</div><div class="lbl">High</div></div>'
+        html += f'<div class="stat"><div class="val" style="color:{med_c}">{len(medium)}</div><div class="lbl">Medium</div></div>'
+        html += f'<div class="stat"><div class="val">{total_mts:,}</div><div class="lbl">Total MTS</div></div>'
+        html += f'<div class="stat"><div class="val">~${total_cost:,.0f}</div><div class="lbl">Est. $/mo</div></div>'
+        if saved_mts:
+            html += f'<div class="stat"><div class="val" style="color:#22c55e">~${saved_cost:,.0f}</div><div class="lbl">Saved $/mo</div></div>'
+        if pct_used is not None:
+            pc_c = "#ef4444" if pct_used > 80 else "#f97316" if pct_used > 60 else "#22c55e"
+            html += f'<div class="stat"><div class="val" style="color:{pc_c}">{pct_used}%</div><div class="lbl">Org Limit Used</div></div>'
+        html += f'<div class="stat"><div class="val">{len(growing)}</div><div class="lbl">Growing</div></div>'
+        html += f'<div class="stat"><div class="val">{len(anomalies)}</div><div class="lbl">Anomalies</div></div>'
+        html += '</div>'
+        # alert banners
+        if growing:
+            names = ", ".join(f"<code>{_h(f['metric'])}</code>" for f in growing[:3])
+            html += f'<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:10px 14px;margin-top:12px;font-size:12px">📈 <strong>{len(growing)} metric(s) growing &gt;20%</strong> since last scan: {names}{"..." if len(growing)>3 else ""}</div>'
+        if new_metrics:
+            html += f'<div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin-top:8px;font-size:12px">🆕 <strong>{len(new_metrics)} new metric(s)</strong> appeared since last scan</div>'
+        if saved_mts:
+            html += f'<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:10px 14px;margin-top:8px;font-size:12px">✅ <strong>Cumulative savings:</strong> {saved_mts:,} MTS / ~${saved_cost:,.2f}/mo across {len(all_resolved)} resolved metric(s)</div>'
+        return html
+
+    def _pills(values, color):
+        """Render a list of values as small coloured pills."""
+        if not values:
+            return '<span style="color:var(--subtle);font-size:11px">—</span>'
+        return "".join(
+            f'<span style="display:inline-block;background:{color}22;border:1px solid {color}55;'
+            f'border-radius:5px;padding:1px 7px;margin:1px 2px;font-size:11px;color:{color};white-space:nowrap">'
+            f'{_h(v)}</span>'
+            for v in values
+        )
+
+    # Top offenders table
+    def offenders_table(rows, limit=None):
+        h = '<button class="btn-expand-cols" onclick="toggleExtraCols(this,\'offenders-tbl\')">Show more columns ▼</button>'
+        h += '<div style="overflow-x:auto"><table id="offenders-tbl"><thead><tr>'
+        h += '<th data-sort>Rank</th><th data-sort>Metric</th><th data-sort>MTS</th>'
+        h += '<th data-sort>Est. Cost/Mo</th><th data-sort>Severity</th>'
+        h += '<th data-sort>Trend</th><th data-sort>Source</th>'
+        h += '<th data-sort>Worst Dimension</th>'
+        h += '<th>Services</th>'
+        h += '<th class="col-extra">Environments</th><th class="col-extra">Cluster / NS</th>'
+        h += '</tr></thead><tbody>'
+        for i, f in enumerate(rows[:limit] if limit else rows, 1):
+            worst       = f["worst_dim"] or "—"
+            worst_count = f["worst_dim_info"]["unique_values"] if f["worst_dim_info"] else 0
+            cost        = f["mts_count"] * MTS_COST_PER_MONTH
+            attr        = f.get("attribution", {})
+            services    = attr.get("services", f["attributed_to"])
+            envs        = attr.get("environments", [])
+            clusters    = attr.get("clusters", [])
+            namespaces  = attr.get("namespaces", [])
+            clus_ns     = clusters + [f"ns:{n}" for n in namespaces]
+            anomaly_tag = (f' <span style="background:#ef4444;color:#fff;border-radius:4px;'
+                           f'padding:1px 5px;font-size:10px;font-weight:700">'
+                           f'{f["baseline_ratio"]}x</span>'
+                           if f.get("anomaly") else "")
+            detail_link = f' <a href="#detail-{i}" style="font-size:10px;color:#3b82f6;text-decoration:none" title="Go to detailed finding">↗</a>'
+            h += '<tr>'
+            h += f'<td data-val="{i}">{i}</td>'
+            h += f'<td><span class="metric-name">{_h(f["metric"])}</span>{anomaly_tag}{detail_link}</td>'
+            h += f'<td data-val="{f["mts_count"]}">{f["mts_count"]:,}</td>'
+            h += f'<td data-val="{cost}">~${cost:,.2f}</td>'
+            h += f'<td>{_sev_badge(f["severity"])}</td>'
+            h += f'<td>{_trend_badge(f.get("trend",""), f.get("growth_pct"))}</td>'
+            h += f'<td style="font-size:11px;color:var(--muted)">{_h(f["instr_source"])}</td>'
+            h += f'<td><span class="dim-name">{_h(worst)}</span> <span style="color:var(--muted);font-size:11px">({worst_count:,})</span></td>'
+            h += f'<td>{_pills(services[:3], "#3b82f6")}</td>'
+            h += f'<td class="col-extra">{_pills(envs[:3], "#22c55e")}</td>'
+            h += f'<td class="col-extra">{_pills(clus_ns[:3], "#8b5cf6")}</td>'
+            h += '</tr>'
+        h += '</tbody></table></div>'
+        return h
+
+    # Build per-service environment + cluster index for scorecard
+    service_envs     = defaultdict(set)
+    service_clusters = defaultdict(set)
+    for f in findings:
+        attr = f.get("attribution", {})
+        for svc in attr.get("services", f["attributed_to"]):
+            for e in attr.get("environments", []):
+                service_envs[svc].add(e)
+            for c in attr.get("clusters", []):
+                service_clusters[svc].add(c)
+            for n in attr.get("namespaces", []):
+                service_clusters[svc].add(f"ns:{n}")
+
     def scorecard_table():
         h = '<table><thead><tr><th data-sort>Rank</th><th data-sort>Service</th>'
         h += '<th data-sort>Total MTS</th><th data-sort>Est. Cost/Mo</th>'
-        h += '<th data-sort>Metrics</th><th data-sort>% of Total</th></tr></thead><tbody>'
+        h += '<th data-sort>Metrics</th><th data-sort>% of Total</th>'
+        h += '<th>Environments</th><th>Cluster / NS</th></tr></thead><tbody>'
         for rank, (svc, svc_total) in enumerate(sorted(service_mts.items(), key=lambda x: -x[1]), 1):
-            pct    = round(svc_total / total_mts * 100, 1) if total_mts else 0
-            cost   = svc_total * MTS_COST_PER_MONTH
+            pct       = round(svc_total / total_mts * 100, 1) if total_mts else 0
+            cost      = svc_total * MTS_COST_PER_MONTH
             n_metrics = len(service_metrics[svc])
-            bar    = f'<div style="height:6px;background:#0366d6;width:{pct}%;border-radius:3px;margin-top:4px"></div>'
-            h += f'<tr><td>{rank}</td><td><code>{_h(svc)}</code></td>'
+            bar       = f'<div style="height:6px;background:#3b82f6;width:{min(pct*2,100)}%;border-radius:3px;margin-top:4px"></div>'
+            envs      = sorted(service_envs.get(svc, []))
+            clus_ns   = sorted(service_clusters.get(svc, []))
+            h += f'<tr><td data-val="{rank}">{rank}</td><td><code style="font-size:12px">{_h(svc)}</code></td>'
             h += f'<td data-val="{svc_total}">{svc_total:,}</td>'
             h += f'<td data-val="{cost}">~${cost:,.2f}</td>'
             h += f'<td>{n_metrics}</td>'
-            h += f'<td data-val="{pct}">{pct}%{bar}</td></tr>'
+            h += f'<td data-val="{pct}">{pct}%{bar}</td>'
+            h += f'<td>{_pills(envs[:4], "#22c55e")}</td>'
+            h += f'<td>{_pills(clus_ns[:3], "#8b5cf6")}</td>'
+            h += '</tr>'
         h += '</tbody></table>'
         return h
 
     # Resolved findings table
     def resolved_table():
         if not all_resolved:
-            return '<p style="color:#586069">No resolved findings yet.</p>'
+            return '<p style="color:var(--muted)">No resolved findings yet.</p>'
         current_map = {f["metric"]: f["mts_count"] for f in findings}
+        max_saved   = max((r[1] - current_map.get(r[0], r[3]) for r in all_resolved), default=1)
         h = '<table><thead><tr><th>Metric</th><th data-sort>Peak MTS</th>'
         h += '<th data-sort>Current MTS</th><th data-sort>MTS Saved</th>'
+        h += '<th>Savings Bar</th>'
         h += '<th data-sort>Cost Saved/Mo</th><th data-sort>Reduction</th>'
         h += '<th>Resolved At</th><th>How</th></tr></thead><tbody>'
         for row in all_resolved:
             metric, peak_mts, peak_at, resolved_mts, resolved_at, reduction_pct, manual = row
-            current   = current_map.get(metric, resolved_mts)
-            mts_saved = peak_mts - current
+            current    = current_map.get(metric, resolved_mts)
+            mts_saved  = peak_mts - current
             cost_saved = mts_saved * MTS_COST_PER_MONTH
-            how = "manual" if manual else "auto"
+            how        = "manual" if manual else "auto"
+            bar_pct    = min(100, round(mts_saved / max(1, max_saved) * 100))
+            bar_html   = (f'<div style="display:flex;align-items:center;gap:6px">'
+                          f'<div style="flex:1;height:8px;background:var(--border);border-radius:4px;min-width:80px">'
+                          f'<div class="savings-bar" style="width:{bar_pct}%"></div></div>'
+                          f'<span style="font-size:10px;color:var(--muted)">{bar_pct}%</span>'
+                          f'</div>')
             h += f'<tr><td><span class="metric-name">{_h(metric)}</span></td>'
             h += f'<td data-val="{peak_mts}">{peak_mts:,}</td>'
             h += f'<td data-val="{current}">{current:,}</td>'
             h += f'<td data-val="{mts_saved}">{mts_saved:,}</td>'
+            h += f'<td>{bar_html}</td>'
             h += f'<td data-val="{cost_saved}">~${cost_saved:,.2f}</td>'
             h += f'<td data-val="{reduction_pct}">-{reduction_pct}%</td>'
             h += f'<td>{_h(resolved_at[:10])}</td><td>{_h(how)}</td></tr>'
@@ -1464,145 +1745,422 @@ def generate_html_report(findings, use_claude=True):
     dim_multi    = {k: v for k, v in dim_groups.items() if len(v) >= 2}
     prefix_multi = {k: v for k, v in prefix_groups.items() if len(v) >= 2}
 
+    def _group_box(title_html, group, dim, dim_info):
+        """Render one duplicate-group box with cost, savings, fix YAML + Copy button."""
+        import math as _m
+        group_mts  = sum(f["mts_count"] for f in group)
+        group_cost = group_mts * MTS_COST_PER_MONTH
+        # Savings estimate: dropping worst_dim typically reduces MTS by 60-90%; use 70% as conservative estimate
+        est_saved_mts  = int(group_mts * 0.70)
+        est_saved_cost = est_saved_mts * MTS_COST_PER_MONTH
+        fix  = generate_fix_yaml(dim, [f["metric"] for f in group], dim_info or {})
+        filt = fix["filter_processor"]
+        tran = fix["transform_processor"]
+        filt_js = filt.replace("\\","\\\\").replace("`","\\`")
+        tran_js = tran.replace("\\","\\\\").replace("`","\\`")
+        h  = f'<div class="group-box">'
+        h += f'<h4>{title_html}</h4>'
+        h += (f'<p style="margin-bottom:8px">'
+              f'<strong>{group_mts:,} combined MTS</strong> &middot; ~${group_cost:,.2f}/mo &middot; '
+              f'{len(group)} metrics &middot; '
+              f'<span style="color:#22c55e;font-weight:600">Est. savings if fixed: ~{est_saved_mts:,} MTS / ~${est_saved_cost:,.2f}/mo</span>'
+              f' &middot; <em>one fix resolves all {len(group)}</em></p>')
+        h += '<table><thead><tr><th>Metric</th><th data-sort>MTS</th><th>Cost/Mo</th><th>Severity</th></tr></thead><tbody>'
+        for f in sorted(group, key=lambda x: -x["mts_count"]):
+            fc = f["mts_count"] * MTS_COST_PER_MONTH
+            h += f'<tr><td><span class="metric-name">{_h(f["metric"])}</span></td>'
+            h += f'<td data-val="{f["mts_count"]}">{f["mts_count"]:,}</td>'
+            h += f'<td data-val="{fc}">~${fc:,.2f}</td>'
+            h += f'<td>{_sev_badge(f["severity"])}</td></tr>'
+        h += '</tbody></table>'
+        h += f'<details style="margin-top:10px"><summary style="cursor:pointer;font-size:12px;color:#3b82f6;font-weight:600">Fix: drop <code>{_h(dim)}</code> (OTel Collector YAML)</summary>'
+        h += f'<div style="margin-top:6px"><button class="copy-yaml-btn" onclick="copyYaml(this,`{filt_js}`)">Copy</button>'
+        h += f'<pre>{_h(filt)}</pre>'
+        h += f'<details><summary style="cursor:pointer;font-size:11px;color:var(--muted)">Alternative: hash instead of drop</summary>'
+        h += f'<button class="copy-yaml-btn" onclick="copyYaml(this,`{tran_js}`)">Copy</button>'
+        h += f'<pre>{_h(tran)}</pre></details></div>'
+        h += '</details></div>'
+        return h
+
     def groups_html():
         h = ""
         if dim_multi:
-            h += "<h3>Grouped by Shared Worst Dimension</h3>"
+            h += '<h3 style="margin-bottom:12px">Grouped by Shared Worst Dimension</h3>'
             for dim, group in sorted(dim_multi.items(), key=lambda x: -sum(f["mts_count"] for f in x[1])):
-                group_mts = sum(f["mts_count"] for f in group)
-                dim_info  = group[0]["worst_dim_info"]
-                fix       = generate_fix_yaml(dim, [f["metric"] for f in group], dim_info)
-                pat_badge = f' <span class="badge" style="background:#d73a49">{_h(dim_info["pattern"])}</span>' if dim_info.get("pattern") else ""
-                h += f'<div class="group-box">'
-                h += f'<h4><span class="dim-name">{_h(dim)}</span> &mdash; {dim_info["unique_values"]:,} unique values{pat_badge}</h4>'
-                h += f'<p style="margin-bottom:8px"><strong>{group_mts:,} combined MTS</strong> &middot; {len(group)} metrics &middot; <em>one fix resolves all {len(group)}</em></p>'
-                h += '<table><thead><tr><th>Metric</th><th data-sort>MTS</th><th>Severity</th></tr></thead><tbody>'
-                for f in sorted(group, key=lambda x: -x["mts_count"]):
-                    h += f'<tr><td><span class="metric-name">{_h(f["metric"])}</span></td>'
-                    h += f'<td data-val="{f["mts_count"]}">{f["mts_count"]:,}</td>'
-                    h += f'<td>{_sev_badge(f["severity"])}</td></tr>'
-                h += '</tbody></table>'
-                h += f'<details><summary>Fix: drop <code>{_h(dim)}</code> (OTel Collector YAML)</summary>'
-                h += f'<pre>{_h(fix["filter_processor"])}</pre>'
-                h += f'<details><summary>Alternative: hash instead of drop</summary>'
-                h += f'<pre>{_h(fix["transform_processor"])}</pre></details>'
-                h += '</details></div>'
+                dim_info  = group[0]["worst_dim_info"] or {}
+                pat_badge = (f' <span class="badge" style="background:#d73a49">{_h(dim_info["pattern"])}</span>'
+                             if dim_info.get("pattern") else "")
+                uv = dim_info.get("unique_values", 0)
+                title_html = f'<span class="dim-name">{_h(dim)}</span> &mdash; {uv:,} unique values{pat_badge}'
+                h += _group_box(title_html, group, dim, dim_info)
+        if prefix_multi:
+            h += '<h3 style="margin-top:24px;margin-bottom:12px">Grouped by Metric Name Prefix (Histogram Family)</h3>'
+            h += '<p style="font-size:12px;color:var(--muted);margin-bottom:14px">Metrics sharing the same base name (e.g. <code>http_request_duration_{bucket,count,sum}</code>) — fixing the worst dimension on any one resolves all siblings.</p>'
+            for prefix, group in sorted(prefix_multi.items(), key=lambda x: -sum(f["mts_count"] for f in x[1])):
+                # Use the worst dim from highest-MTS member
+                anchor_f  = max(group, key=lambda x: x["mts_count"])
+                worst_dim = anchor_f.get("worst_dim") or "unknown"
+                dim_info  = anchor_f.get("worst_dim_info") or {}
+                title_html = f'<code style="font-size:13px">{_h(prefix)}_*</code> &mdash; {len(group)} metric variants'
+                h += _group_box(title_html, group, worst_dim, dim_info)
         return h
 
     # Detailed findings
     def detailed_html():
         h = ""
         for i, f in enumerate(findings, 1):
-            attr = f.get("attribution", {})
-            sev  = f["severity"]
+            attr      = f.get("attribution", {})
+            sev       = f["severity"]
+            cost      = f["mts_count"] * MTS_COST_PER_MONTH
+            services  = attr.get("services",     f["attributed_to"])
+            envs      = attr.get("environments", [])
+            clusters  = attr.get("clusters",     [])
+            namespaces= attr.get("namespaces",   [])
+            pods      = attr.get("pods",         [])
+            sdk       = attr.get("sdk",          "")
+
+            # Trend string
             trend_str = f.get("trend", "")
             if f.get("prev_count") is not None and f.get("growth_pct") is not None:
-                pct = int(f["growth_pct"] * 100)
-                trend_str += f" ({f['prev_count']:,} → {f['mts_count']:,}, {'+' if pct >= 0 else ''}{pct}%)"
-            cost = f["mts_count"] * MTS_COST_PER_MONTH
+                gpct = int(f["growth_pct"] * 100)
+                trend_str += f" ({f['prev_count']:,} → {f['mts_count']:,}, {'+' if gpct >= 0 else ''}{gpct}%)"
 
-            h += f'<details><summary>{i}. <span class="metric-name">{_h(f["metric"])}</span> &nbsp; {_sev_badge(sev)} &nbsp; {f["mts_count"]:,} MTS &nbsp; ~${cost:,.2f}/mo</summary>'
-            h += '<div style="padding:12px 0">'
-            h += f'<p><strong>Instrumentation:</strong> {_h(f["instr_source"])} &mdash; <em>{_h(f["instr_desc"])}</em></p>'
-            h += f'<p><strong>Trend:</strong> {_trend_badge(f.get("trend",""), f.get("growth_pct"))} {_h(trend_str)}</p>'
-            h += f'<p><strong>Services:</strong> {_h(", ".join(attr.get("services", f["attributed_to"])))}</p>'
-            if attr.get("environments"):
-                h += f'<p><strong>Environments:</strong> {_h(", ".join(attr["environments"]))}</p>'
-            if attr.get("clusters"):
-                h += f'<p><strong>Clusters:</strong> {_h(", ".join(attr["clusters"]))}</p>'
-            if attr.get("sdk"):
-                h += f'<p><strong>SDK:</strong> {_h(attr["sdk"])}</p>'
+            anomaly_html = ""
+            if f.get("anomaly"):
+                anomaly_html = (f'<span style="background:#ef4444;color:#fff;border-radius:5px;'
+                                f'padding:2px 8px;font-size:11px;font-weight:700;margin-left:8px">'
+                                f'ANOMALY {f["baseline_ratio"]}x baseline ({f["baseline_samples"]} samples)</span>')
 
+            h += (f'<details class="finding" id="detail-{i}">'
+                  f'<summary>{i}. <span class="metric-name">{_h(f["metric"])}</span>'
+                  f' &nbsp; {_sev_badge(sev)} &nbsp; {f["mts_count"]:,} MTS &nbsp; ~${cost:,.2f}/mo'
+                  f'{anomaly_html}</summary>')
+            h += '<div style="padding:14px 0 6px">'
+
+            # ── Context block ──────────────────────────────────────────────
+            h += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-bottom:14px">'
+
+            def _ctx_cell(label, content):
+                return (f'<div style="background:var(--hover);border:1px solid var(--border);'
+                        f'border-radius:8px;padding:10px 12px">'
+                        f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;'
+                        f'letter-spacing:.05em;color:var(--subtle);margin-bottom:6px">{label}</div>'
+                        f'{content}</div>')
+
+            h += _ctx_cell("Services",     _pills(services,   "#3b82f6") if services  != ["unknown"] else '<span style="color:var(--subtle);font-size:11px">unknown</span>')
+            h += _ctx_cell("Environments", _pills(envs,       "#22c55e") if envs       else '<span style="color:var(--subtle);font-size:11px">not detected</span>')
+            h += _ctx_cell("Clusters",     _pills(clusters,   "#8b5cf6") if clusters   else '<span style="color:var(--subtle);font-size:11px">not detected</span>')
+            if namespaces:
+                h += _ctx_cell("Namespaces", _pills(namespaces, "#6366f1"))
+            if pods:
+                h += _ctx_cell(f"Sample Pods ({len(pods)})", _pills(pods, "#f97316"))
+
+            # Instrumentation source cell
+            h += _ctx_cell("Instrumentation",
+                            f'<span style="font-size:12px;font-weight:600">{_h(f["instr_source"])}</span>'
+                            + (f'<br><span style="font-size:11px;color:var(--muted)">{_h(f["instr_desc"])}</span>'
+                               if f.get("instr_desc") else ""))
+
+            # Metric metadata cell
+            type_badge  = f'<span style="background:#e2e8f0;border-radius:4px;padding:1px 6px;font-size:11px">{_h(f["type"])}</span>'
+            custom_badge= (f' <span style="background:#fef3c7;color:#92400e;border-radius:4px;padding:1px 6px;font-size:11px">custom</span>'
+                           if f.get("custom") else
+                           f' <span style="background:#f0fdf4;color:#166534;border-radius:4px;padding:1px 6px;font-size:11px">builtin</span>')
+            limit_line  = (f'<br><span style="font-size:11px;color:var(--muted)">{f["limit_pct"]}% of org limit</span>'
+                           if f.get("limit_pct") is not None else "")
+            h += _ctx_cell("Metric Type", type_badge + custom_badge + limit_line)
+
+            # Trend / history cell
+            peak_line = ""
+            if f.get("peak_mts") and f["peak_mts"] != f["mts_count"]:
+                peak_line = (f'<br><span style="font-size:11px;color:var(--muted)">'
+                             f'Peak: {f["peak_mts"]:,} MTS on {_h(str(f["peak_at"])[:10])}</span>')
+            h += _ctx_cell("Trend",
+                            _trend_badge(f.get("trend",""), f.get("growth_pct"))
+                            + (f' <span style="font-size:11px;color:var(--muted)">{_h(trend_str)}</span>'
+                               if trend_str else "")
+                            + peak_line)
+
+            if sdk:
+                h += _ctx_cell("SDK", f'<span style="font-size:11px;font-family:monospace">{_h(sdk)}</span>')
+
+            h += '</div>'  # end context grid
+
+            # ── Dimension table ────────────────────────────────────────────
             if f["dimensions"]:
-                h += '<table style="margin-top:10px"><thead><tr><th>Dimension</th><th data-sort>Unique Values</th><th>Pattern</th><th>Sample Values</th></tr></thead><tbody>'
-                for dim, info in list(f["dimensions"].items())[:8]:
+                worst_val = max((info["unique_values"] for info in f["dimensions"].values()), default=1)
+                h += ('<table style="margin-bottom:10px"><thead><tr>'
+                      '<th data-sort>Dimension</th>'
+                      '<th data-sort>Unique Values</th>'
+                      '<th>% of Worst</th>'
+                      '<th>Anti-pattern</th>'
+                      '<th>Sample Values</th>'
+                      '</tr></thead><tbody>')
+                for dim, info in list(f["dimensions"].items())[:10]:
                     pattern = info["pattern"] or "—"
-                    samples = ", ".join(f"<code>{_h(v)}</code>" for v in info["sample_values"][:3])
-                    h += f'<tr><td><span class="dim-name">{_h(dim)}</span></td>'
-                    h += f'<td data-val="{info["unique_values"]}">{info["unique_values"]:,}</td>'
-                    h += f'<td>{_h(pattern)}</td><td>{samples}</td></tr>'
+                    samples = " &nbsp; ".join(f'<code style="font-size:11px">{_h(v)}</code>'
+                                              for v in info["sample_values"][:4])
+                    pat_color = "#ef4444" if info["pattern"] else "var(--muted)"
+                    pct_worst = round(info["unique_values"] / max(1, worst_val) * 100)
+                    bar_color = "#ef4444" if pct_worst >= 80 else "#f97316" if pct_worst >= 40 else "#3b82f6"
+                    bar_html  = (f'<div style="display:flex;align-items:center;gap:6px">'
+                                 f'<div style="flex:1;height:6px;background:var(--border);border-radius:3px;min-width:60px">'
+                                 f'<div style="height:6px;background:{bar_color};width:{pct_worst}%;border-radius:3px"></div></div>'
+                                 f'<span style="font-size:11px;color:var(--muted);min-width:30px">{pct_worst}%</span>'
+                                 f'</div>')
+                    h += (f'<tr>'
+                          f'<td><span class="dim-name">{_h(dim)}</span></td>'
+                          f'<td data-val="{info["unique_values"]}" style="font-weight:700">{info["unique_values"]:,}</td>'
+                          f'<td data-val="{pct_worst}">{bar_html}</td>'
+                          f'<td><span style="color:{pat_color};font-size:11px">{_h(pattern)}</span></td>'
+                          f'<td style="font-size:11px">{samples}</td>'
+                          f'</tr>')
                 h += '</tbody></table>'
+
+            # ── AI Remediation ─────────────────────────────────────────────
+            # ── OTel Collector Fix YAML ────────────────────────────────────
+            if f["worst_dim"]:
+                dim_info = f.get("worst_dim_info") or {}
+                fix = generate_fix_yaml(f["worst_dim"], [f["metric"]], dim_info)
+                filter_yaml    = fix["filter_processor"]
+                transform_yaml = fix["transform_processor"]
+                filter_js    = filter_yaml.replace("\\","\\\\").replace("`","\\`")
+                transform_js = transform_yaml.replace("\\","\\\\").replace("`","\\`")
+                h += (f'<details style="margin-top:8px">'
+                      f'<summary style="cursor:pointer;font-size:12px;color:#3b82f6;font-weight:600">'
+                      f'OTel Collector Fix (YAML)</summary>'
+                      f'<div style="margin-top:8px">'
+                      f'<button class="copy-yaml-btn" onclick="copyYaml(this, `{filter_js}`)">Copy</button>'
+                      f'<pre>{_h(filter_yaml)}</pre>'
+                      f'<details style="margin-top:4px"><summary style="cursor:pointer;font-size:11px;color:var(--muted)">Alternative: hash instead of drop</summary>'
+                      f'<button class="copy-yaml-btn" onclick="copyYaml(this, `{transform_js}`)">Copy</button>'
+                      f'<pre>{_h(transform_yaml)}</pre></details>'
+                      f'</div></details>')
 
             if use_claude and sev in ("CRITICAL", "HIGH"):
                 print(f"  Generating AI remediation for {f['metric']}...")
                 remediation = generate_remediation(f)
-                h += f'<details style="margin-top:10px"><summary>AI Remediation</summary><pre>{_h(remediation)}</pre></details>'
+                h += (f'<details style="margin-top:6px">'
+                      f'<summary style="cursor:pointer;font-size:12px;color:#3b82f6;font-weight:600">'
+                      f'AI Remediation</summary>'
+                      f'<pre style="margin-top:8px">{_h(remediation)}</pre></details>')
 
             h += '</div></details>'
+        return h
+
+    # Source breakdown
+    def _source_breakdown_html():
+        source_mts     = defaultdict(int)
+        source_metrics = defaultdict(set)
+        source_cost    = defaultdict(float)
+        for f in findings:
+            src = f["instr_source"]
+            source_mts[src]     += f["mts_count"]
+            source_metrics[src].add(f["metric"])
+            source_cost[src]    += f["mts_count"] * MTS_COST_PER_MONTH
+        if not source_mts:
+            return '<p style="color:var(--muted)">No findings to break down.</p>'
+        max_src_mts = max(source_mts.values(), default=1)
+        h  = '<table><thead><tr>'
+        h += '<th data-sort>Source</th><th data-sort>Metrics</th>'
+        h += '<th data-sort>Total MTS</th><th>MTS Share</th>'
+        h += '<th data-sort>Est. Cost/Mo</th></tr></thead><tbody>'
+        for src, smts in sorted(source_mts.items(), key=lambda x: -x[1]):
+            pct   = round(smts / max(1, total_mts) * 100, 1)
+            bar_w = round(smts / max_src_mts * 100)
+            bar_c = "#3b82f6" if "otel" in src.lower() else "#8b5cf6" if "splunk" in src.lower() else "#f97316"
+            bar_html = (f'<div style="display:flex;align-items:center;gap:6px">'
+                        f'<div style="flex:1;height:8px;background:var(--border);border-radius:4px;min-width:80px">'
+                        f'<div style="height:8px;background:{bar_c};width:{bar_w}%;border-radius:4px"></div></div>'
+                        f'<span style="font-size:11px;color:var(--muted)">{pct}%</span></div>')
+            h += (f'<tr><td style="font-weight:600">{_h(src)}</td>'
+                  f'<td data-val="{len(source_metrics[src])}">{len(source_metrics[src])}</td>'
+                  f'<td data-val="{smts}">{smts:,}</td>'
+                  f'<td>{bar_html}</td>'
+                  f'<td data-val="{source_cost[src]}">~${source_cost[src]:,.2f}</td></tr>')
+        h += '</tbody></table>'
         return h
 
     # Ignored patterns
     def ignored_html():
         if not ignored_patterns:
-            return '<p style="color:#586069">No patterns in ignore list.</p>'
+            return '<p style="color:var(--muted)">No patterns in ignore list.</p>'
         h = '<table><thead><tr><th>Pattern</th><th>Reason</th><th>Since</th></tr></thead><tbody>'
         for pattern, reason, ignored_at in ignored_patterns:
             h += f'<tr><td><code>{_h(pattern)}</code></td><td>{_h(reason or "—")}</td><td>{_h(ignored_at[:10])}</td></tr>'
         h += '</tbody></table>'
         return h
 
-    gen_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    # Scan history card
+    def _history_card():
+        if not scan_history:
+            return ""
+        import math as _m
+
+        # scan_history is newest-first; reverse for chronological order in sparkline
+        chrono = list(reversed(scan_history))
+        mts_vals = [row[2] for row in chrono]
+
+        # Build inline SVG sparkline (80×24 px)
+        def _sparkline(vals):
+            if len(vals) < 2:
+                return ""
+            mn, mx = min(vals), max(vals)
+            rng = mx - mn or 1
+            W, H = 80, 24
+            pts = []
+            for idx, v in enumerate(vals):
+                x = round(idx / (len(vals) - 1) * W, 1)
+                y = round(H - (v - mn) / rng * (H - 4) - 2, 1)
+                pts.append(f"{x},{y}")
+            path = " ".join(pts)
+            last_color = "#ef4444" if vals[-1] > vals[0] else "#22c55e"
+            return (f'<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
+                    f'style="display:inline-block;vertical-align:middle" xmlns="http://www.w3.org/2000/svg">'
+                    f'<polyline points="{path}" fill="none" stroke="{last_color}" stroke-width="1.5" stroke-linejoin="round"/>'
+                    f'</svg>')
+
+        sparkline_svg = _sparkline(mts_vals)
+
+        # Build rows chronologically so deltas are vs previous scan, then reverse for newest-first display
+        row_htmls = []
+        prev_mts = None
+        for row in chrono:
+            scanned_at, total_metrics, t_mts, crit, hi, med, ign = row
+            cost   = t_mts * MTS_COST_PER_MONTH
+            crit_c = "#ef4444" if crit else "var(--muted)"
+            if prev_mts is not None:
+                delta     = t_mts - prev_mts
+                delta_pct = round(delta / max(1, prev_mts) * 100, 1)
+                sign      = "+" if delta >= 0 else ""
+                dc        = "#ef4444" if delta > 0 else "#22c55e" if delta < 0 else "var(--muted)"
+                delta_html = f'<span style="color:{dc};font-size:11px;font-weight:600">{sign}{delta:,} ({sign}{delta_pct}%)</span>'
+            else:
+                delta_html = '<span style="color:var(--muted);font-size:11px">—</span>'
+            row_htmls.append(
+                f'<tr>'
+                f'<td style="font-size:12px">{_h(scanned_at[:16].replace("T"," "))}</td>'
+                f'<td style="text-align:center">{total_metrics:,}</td>'
+                f'<td style="text-align:center;font-weight:700">{t_mts:,}</td>'
+                f'<td style="text-align:center">{delta_html}</td>'
+                f'<td style="text-align:center">~${cost:,.2f}</td>'
+                f'<td style="text-align:center;color:{crit_c};font-weight:700">{crit}</td>'
+                f'<td style="text-align:center">{hi}</td>'
+                f'<td style="text-align:center">{med}</td>'
+                f'<td style="text-align:center;color:var(--muted)">{ign}</td>'
+                f'</tr>'
+            )
+            prev_mts = t_mts
+        rows = "".join(reversed(row_htmls))
+
+        sparkline_header = (f' &nbsp; {sparkline_svg}' if sparkline_svg else "")
+        body = (f'<div style="margin-bottom:12px;font-size:12px;color:var(--muted)">'
+                f'MTS trend across scans:{sparkline_header}</div>'
+                f'<table><thead><tr>'
+                f'<th data-sort>Date</th><th data-sort style="text-align:center">Metrics</th>'
+                f'<th data-sort style="text-align:center">Total MTS</th>'
+                f'<th data-sort style="text-align:center">Δ MTS</th>'
+                f'<th data-sort style="text-align:center">Est. Cost/Mo</th>'
+                f'<th data-sort style="text-align:center">Critical</th><th data-sort style="text-align:center">High</th>'
+                f'<th data-sort style="text-align:center">Medium</th><th data-sort style="text-align:center">Ignored</th>'
+                f'</tr></thead><tbody>{rows}</tbody></table>')
+        return _card(f"Scan History ({len(scan_history)} scans)", body, anchor="sec-history", open_by_default=True)
+
+    gen_time   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     limit_line = f" &middot; Org limit: {mts_limit:,} ({pct_used}% used)" if mts_limit else ""
 
+    # Build section cards
+    overview_body       = _stat_grid()
+    offenders_body      = offenders_table(findings, limit=50)
+    scorecard_body      = scorecard_table()
+    _groups_result      = groups_html()
+    groups_body         = _groups_result or '<p style="color:var(--muted)">No duplicate groups found.</p>'
+    source_body         = _source_breakdown_html()
+    resolved_body       = resolved_table()
+    detailed_body       = (f'<p style="margin-bottom:12px;color:var(--muted);font-size:12px">Click a metric to expand dimension analysis and AI remediation.</p>'
+                           + detailed_html())
+    ignored_body        = ignored_html()
+
+    sticky_risk = ""
+    if critical:
+        sticky_risk += f'<span class="sb-risk">{len(critical)} CRITICAL</span>'
+    if growing:
+        sticky_risk += f' <span class="sb-warn">{len(growing)} GROWING</span>'
+
     html = f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Cardinality Governance Report — {_h(REALM)}</title>
-<style>{css}</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Cardinality Governance — {_h(REALM)}</title>
+  <style>{css}</style>
 </head>
 <body>
-<div class="container">
-  <h1>Metric Cardinality Governance</h1>
-  <div class="meta">Generated {_h(gen_time)} &middot; Realm: <strong>{_h(REALM)}</strong> &middot; {len(findings)} metrics analyzed{limit_line}</div>
 
-  {cards_html}
-  {alerts_html}
-
-  <div class="tab-nav">
-    <button class="tab-btn active" onclick="showTab('tab-offenders')">Top Offenders</button>
-    <button class="tab-btn" onclick="showTab('tab-scorecard')">Service Scorecard</button>
-    <button class="tab-btn" onclick="showTab('tab-groups')">Duplicate Groups</button>
-    <button class="tab-btn" onclick="showTab('tab-resolved')">Resolved ({len(all_resolved)})</button>
-    <button class="tab-btn" onclick="showTab('tab-details')">Detailed Findings</button>
-    <button class="tab-btn" onclick="showTab('tab-ignored')">Ignored ({len(ignored_patterns)})</button>
+  <div id="sticky-bar">
+    <span class="sb-grade" style="color:{grade_color}">{grade}</span>
+    <span style="color:#94a3b8">{health_score}/100</span>
+    <span class="sb-sep">|</span>
+    <span>{len(critical)} critical &nbsp; {len(high)} high &nbsp; {len(medium)} medium</span>
+    <span class="sb-sep">|</span>
+    <span>{total_mts:,} MTS &nbsp; ~${total_cost:,.2f}/mo</span>
+    {f'<span class="sb-sep">|</span> {sticky_risk}' if sticky_risk else ""}
+    <span class="sb-close" onclick="document.getElementById('sticky-bar').classList.add('hidden')" title="Dismiss">&#x2715;</span>
   </div>
 
-  <div id="tab-offenders" class="tab-pane active">
-    <h2>Top Offenders</h2>
-    {offenders_table(findings, limit=50)}
+  <div class="layout">
+
+    <nav class="sidebar" id="sidebar">
+      <div style="font-size:13px;font-weight:700;color:var(--text);margin-bottom:12px">Sections</div>
+      <input id="search-box" type="text" placeholder="Search report..." oninput="filterReport(this.value)">
+      <div id="nav-links"></div>
+    </nav>
+
+    <div class="page">
+      <header>
+        <div>
+          <h1>Splunk Observability — Cardinality Governance</h1>
+          <p>realm={_h(REALM)} &nbsp;|&nbsp; generated {_h(gen_time)} &nbsp;|&nbsp; {len(findings)} metrics analyzed{limit_line}</p>
+        </div>
+        <div class="header-controls">
+          <button class="btn-toggle" onclick="toggleDark()">&#x1F319; Dark mode</button>
+          <button class="btn-toggle" onclick="window.print()">&#x1F5A8; Print</button>
+        </div>
+      </header>
+
+      {_exec_summary()}
+
+      {_actions_card()}
+
+      {_card("Overview", overview_body, anchor="sec-overview")}
+
+      {_card("Top Offenders", offenders_body, anchor="sec-offenders",
+             border_color="#ef4444" if critical else "#f97316")}
+
+      {_card("Per-Service Scorecard", scorecard_body, anchor="sec-scorecard")}
+
+      {_card("Instrumentation Source Breakdown", source_body, anchor="sec-sources", open_by_default=True)}
+
+      {_card("Duplicate / Similar Groups",
+             '<p style="font-size:12px;color:var(--muted);margin-bottom:14px">Metrics sharing the same high-cardinality dimension or name prefix — one OTel Collector fix resolves the whole group.</p>' + groups_body,
+             anchor="sec-groups", open_by_default=bool(dim_multi or prefix_multi))}
+
+      {_card(f"Resolved Findings ({len(all_resolved)})", resolved_body, anchor="sec-resolved",
+             border_color="#22c55e" if all_resolved else None, open_by_default=bool(all_resolved))}
+
+      {_card("Detailed Findings", detailed_body, anchor="sec-details", open_by_default=True)}
+
+      {_history_card()}
+
+      {_card(f"Ignored Patterns ({len(ignored_patterns)})", ignored_body, anchor="sec-ignored",
+             open_by_default=True)}
+
+      <p style="margin-top:32px;color:var(--subtle);font-size:11px">
+        Generated by Metric Cardinality Governance &mdash; Splunk Observability Cloud
+      </p>
+    </div>
   </div>
 
-  <div id="tab-scorecard" class="tab-pane">
-    <h2>Per-Service Cardinality Scorecard</h2>
-    {scorecard_table()}
-  </div>
-
-  <div id="tab-groups" class="tab-pane">
-    <h2>Duplicate / Similar Metric Groups</h2>
-    <p style="margin-bottom:16px;color:#586069">Metrics sharing the same high-cardinality dimension — one collector fix resolves the whole group.</p>
-    {groups_html()}
-  </div>
-
-  <div id="tab-resolved" class="tab-pane">
-    <h2>Resolved Findings</h2>
-    {resolved_table()}
-  </div>
-
-  <div id="tab-details" class="tab-pane">
-    <h2>Detailed Findings</h2>
-    <p style="margin-bottom:12px;color:#586069">Click a metric to expand dimension analysis and AI remediation.</p>
-    {detailed_html()}
-  </div>
-
-  <div id="tab-ignored" class="tab-pane">
-    <h2>Ignored Patterns</h2>
-    {ignored_html()}
-  </div>
-
-  <p style="margin-top:32px;color:#586069;font-size:0.8rem">Generated by Metric Cardinality Governance &mdash; Splunk Observability Cloud</p>
-</div>
 <script>{js}</script>
 </body>
 </html>"""
