@@ -154,9 +154,16 @@ python3 cardinality_governance.py scan [--top N] [--verbose]
 Fetches all metrics, counts MTS per metric, ranks by highest cardinality. Metrics growing faster than their 7-day baseline are tagged `[ANOMALY Nx]`.
 
 ```
-Rank  Metric                               MTS   Trend          Severity    Source                Worst Dimension
-1     http.client.request.duration_bucket  1,215 GROWING(+30%)  HIGH        HTTP Instrumentation  server.address (21) [ANOMALY 4.0x]
-2     http.server.request.duration_bucket    810 STABLE         MEDIUM      HTTP Instrumentation  http.route (24)
+Scanning org (realm=us1)...
+
+  Fetching metric catalog (paginated)...
+  Found 1046 metrics. Analyzing top offenders...
+
+
+Rank  Metric                                             MTS Trend        Severity     Source                       Worst Dimension
+--------------------------------------------------------------------------------------------------------------------------------------------
+1     http.client.request.duration_bucket              1,320 ➡️STABLE       🟠HIGH          HTTP Instrumentation         server.address (21)
+2     http.server.request.duration_bucket                900 ➡️STABLE       🟡MEDIUM        HTTP Instrumentation         http.route (22)
 ```
 
 | Column | Description |
@@ -492,8 +499,13 @@ Uses `fnmatch` glob syntax. Stored in `cardinality_state.db`.
 ### Scan history
 
 ```bash
-python3 cardinality_governance.py history
+python3 cardinality_governance.py history [--limit N]
 ```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--limit` | 30 | Number of past scans to show |
+
 
 ```
 Date                    Metrics  Total MTS  Est Cost/Mo   CRIT  HIGH  MED  Ignored
@@ -604,6 +616,23 @@ python3 cardinality_governance.py watch --interval 300 --threshold 5000
 |-------|---------|
 | `cardinality.explosion.detected` | Metric crosses threshold for the first time |
 | `cardinality.explosion.growing` | Existing high-cardinality metric grew >50% |
+
+---
+
+## Example terminal output
+
+```
+Scanning org (realm=us1)...
+
+  Fetching metric catalog (paginated)...
+  Found 1046 metrics. Analyzing top offenders...
+
+
+Rank  Metric                                             MTS Trend        Severity     Source                       Worst Dimension
+--------------------------------------------------------------------------------------------------------------------------------------------
+1     http.client.request.duration_bucket              1,320 ➡️STABLE       🟠HIGH          HTTP Instrumentation         server.address (21)
+2     http.server.request.duration_bucket                900 ➡️STABLE       🟡MEDIUM        HTTP Instrumentation         http.route (22)
+```
 
 ---
 
