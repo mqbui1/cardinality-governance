@@ -619,6 +619,10 @@ python3 cardinality_governance.py watch --interval 300 --threshold 5000
 
 ---
 
+## Sample report
+
+![Cardinality Governance Report](reports/samplereport.png)
+
 ## Example terminal output
 
 ```
