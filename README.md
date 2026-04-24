@@ -623,23 +623,6 @@ python3 cardinality_governance.py watch --interval 300 --threshold 5000
 
 ![Cardinality Governance Report](reports/samplereport.png)
 
-## Example terminal output
-
-```
-Scanning org (realm=us1)...
-
-  Fetching metric catalog (paginated)...
-  Found 1046 metrics. Analyzing top offenders...
-
-
-Rank  Metric                                             MTS Trend        Severity     Source                       Worst Dimension
---------------------------------------------------------------------------------------------------------------------------------------------
-1     http.client.request.duration_bucket              1,320 ➡️STABLE       🟠HIGH          HTTP Instrumentation         server.address (21)
-2     http.server.request.duration_bucket                900 ➡️STABLE       🟡MEDIUM        HTTP Instrumentation         http.route (22)
-```
-
----
-
 ## State and persistence
 
 All state stored in `cardinality_state.db` (SQLite, auto-created):
