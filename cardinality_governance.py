@@ -18,8 +18,10 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,9 +42,14 @@ INGEST_BASE = f"https://ingest.{REALM}.signalfx.com"
 BEDROCK_PROFILE = "arn:aws:bedrock:us-west-2:387769110234:application-inference-profile/fky19kpnw2m7"
 
 # Thresholds
-CRITICAL_MTS_COUNT    = 10_000   # single metric MTS count — critical
-HIGH_MTS_COUNT        = 1_000    # single metric MTS count — high
-MEDIUM_MTS_COUNT      = 500      # single metric MTS count — medium
+CRITICAL_MTS_COUNT    = int(os.environ.get("CRITICAL_MTS_THRESHOLD", "10000"))
+HIGH_MTS_COUNT        = int(os.environ.get("HIGH_MTS_THRESHOLD",     "1000"))
+MEDIUM_MTS_COUNT      = int(os.environ.get("MEDIUM_MTS_THRESHOLD",   "100"))
+
+# Module-level stats populated by scan_org — used by generate_html_report
+_scan_env_stats:  dict = {}   # {env_name: {"mts": int, "metrics": int}}
+_scan_tms_below:  list = []   # below-threshold APM metrics for TMS section
+                               # each entry: {"metric": str, "mts_count": int, "detail": {...}}
 CRITICAL_DIM_VALUES   = 10_000   # unique values for a single dimension — critical
 HIGH_DIM_VALUES       = 1_000    # unique values for a single dimension — high
 
@@ -55,6 +62,45 @@ CARDINALITY_PATTERNS = [
     (re.compile(r"^[0-9a-f]{40}$", re.I),                                                    "SHA1 hash"),
     (re.compile(r".{100,}"),                                                                  "Very long string"),
 ]
+
+# Attack/probe signatures for APM operation name analysis
+APM_ATTACK_SIGNATURES = [
+    (re.compile(r'oastify\.com|burpcollaborator\.net|interact\.sh', re.I), 'DNS OOB (Burp Collaborator)'),
+    (re.compile(r'xp_dirtree|exec\s+master', re.I),                        'SQL injection — MSSQL'),
+    (re.compile(r'load_file\s*\(|into\s+outfile', re.I),                   'SQL injection — MySQL'),
+    (re.compile(r"'\s*(and|or)\s*\d+=\d+", re.I),                          'SQL injection — boolean'),
+    (re.compile(r'nslookup\s+-q=', re.I),                                  'DNS exfiltration'),
+    (re.compile(r'declare\s+@\w+\s+varchar', re.I),                        'SQL injection — MSSQL declare'),
+    (re.compile(r'\{\{.*?\}\}|#set\s*\(|\$\{[^}]+\}', re.I),              'SSTI (template injection)'),
+    (re.compile(r'response\.write\s*\(', re.I),                            'SSTI — ColdFusion'),
+    (re.compile(r'__import__\s*\(', re.I),                                  'Python RCE'),
+    (re.compile(r'%2e%2e|\.\.[\\/]|\.\.%5c|\.\.%2f', re.I),               'Path traversal'),
+    (re.compile(r'(phpinfo|adminer|lfm|webshell|c99|r57|shell)\.php', re.I), 'PHP shell probe'),
+    (re.compile(r'/\.env($|[/?#])',),                                       '.env file probe'),
+    (re.compile(r'WEB-INF|win\.ini|winnt[\\/]|etc[\\/]passwd', re.I),      'File enumeration'),
+    (re.compile(r'<script|javascript:|onerror\s*=', re.I),                  'XSS probe'),
+    (re.compile(r'\|\s*echo\s+\w+|\|\s*id\b|\|\s*whoami', re.I),           'OS command injection'),
+    (re.compile(r'/[a-z0-9]{6,12}\.jsp($|[/?#])', re.I),                   'Random JSP filename probe (scanner)'),
+]
+
+# APM operation name exclusion categories — operations that should be filtered from MMS
+APM_EXCLUSION_CLASSES = {
+    "health_check": re.compile(
+        r'^/(health|healthcheck|ping|ready|live|liveness|readiness)(/|$)'
+        r'|/actuator/(health|info|metrics|prometheus|env)(/|$)', re.I),
+    "static_asset": re.compile(
+        r'\.(js|css|woff2?|ttf|eot|ico|png|jpg|jpeg|gif|svg|map|webp)(\?|$)'
+        r'|tfe-eks-p2x'
+        r'|chunk-[A-Z0-9]{6,}\.js', re.I),
+    "swagger_docs": re.compile(
+        r'swagger-ui|api-docs|openapi|swagger-resources|v3/api-docs', re.I),
+    "jvm_classname": re.compile(
+        r'\$\$Lambda\$\d+/0x[0-9a-f]+@'
+        r'|org\.springframework\.'
+        r'|com\.sun\.proxy\.\$Proxy'),
+    "bare_method": re.compile(
+        r'^(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)$'),
+}
 
 REPORTS_DIR  = Path("reports")
 STATE_DB     = Path("cardinality_state.db")
@@ -73,16 +119,26 @@ MTS_COST_PER_MONTH = float(os.environ.get("MTS_COST_PER_MONTH", "0.002"))
 
 def api_get(path, params=None):
     headers = {"X-SF-TOKEN": TOKEN, "Content-Type": "application/json"}
-    resp = requests.get(f"{API_BASE}{path}", headers=headers, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    for attempt in range(3):
+        resp = requests.get(f"{API_BASE}{path}", headers=headers, params=params, timeout=30)
+        if resp.status_code == 429 or resp.status_code >= 500:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+        resp.raise_for_status()
+        return resp.json()
 
 
 def api_post(path, body):
     headers = {"X-SF-TOKEN": TOKEN, "Content-Type": "application/json"}
-    resp = requests.post(f"{API_BASE}{path}", headers=headers, json=body, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    for attempt in range(3):
+        resp = requests.post(f"{API_BASE}{path}", headers=headers, json=body, timeout=30)
+        if resp.status_code == 429 or resp.status_code >= 500:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+        resp.raise_for_status()
+        return resp.json()
 
 
 def ingest_event(event_type, dimensions, properties):
@@ -134,14 +190,17 @@ def execute_signalflow(program, duration_ms=60000):
 # ---------------------------------------------------------------------------
 
 def call_claude(prompt):
-    client = boto3.client("bedrock-runtime", region_name="us-west-2")
-    body = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 2048,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    resp = client.invoke_model(modelId=BEDROCK_PROFILE, body=json.dumps(body))
-    return json.loads(resp["body"].read())["content"][0]["text"]
+    try:
+        client = boto3.client("bedrock-runtime", region_name="us-west-2")
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 2048,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        resp = client.invoke_model(modelId=BEDROCK_PROFILE, body=json.dumps(body))
+        return json.loads(resp["body"].read())["content"][0]["text"]
+    except Exception as e:
+        return f"[AI remediation unavailable: {e}]"
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +470,70 @@ def db_get_scan_history(limit=30):
 
 
 # ---------------------------------------------------------------------------
+# APM ops snapshot persistence
+# ---------------------------------------------------------------------------
+
+def db_save_ops_snapshot(analysis, environment=None):
+    """Persist a summary of an apm-ops-scan run for trending."""
+    conn = db_connect()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS apm_ops_snapshots (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            scanned_at      TEXT NOT NULL,
+            realm           TEXT NOT NULL,
+            environment     TEXT NOT NULL DEFAULT '',
+            total_ops       INTEGER NOT NULL,
+            attack_count    INTEGER NOT NULL DEFAULT 0,
+            excl_count      INTEGER NOT NULL DEFAULT 0,
+            consol_saveable INTEGER NOT NULL DEFAULT 0,
+            nonprod_count   INTEGER NOT NULL DEFAULT 0,
+            prod_count      INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    ts = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT INTO apm_ops_snapshots
+               (scanned_at, realm, environment, total_ops, attack_count,
+                excl_count, consol_saveable, nonprod_count, prod_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (ts, REALM, environment or "",
+         analysis["total"], len(analysis["attacks"]),
+         analysis["total_excl"], analysis["total_mts_saveable"],
+         analysis["nonprod_count"], analysis["prod_count"])
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_get_ops_history(environment=None, limit=30):
+    """Return the last N apm-ops-scan summaries, newest first."""
+    if not STATE_DB.exists():
+        return []
+    conn = db_connect()
+    # CREATE TABLE IF NOT EXISTS so it doesn't fail on first run
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS apm_ops_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scanned_at TEXT NOT NULL, realm TEXT NOT NULL,
+            environment TEXT NOT NULL DEFAULT '',
+            total_ops INTEGER NOT NULL, attack_count INTEGER NOT NULL DEFAULT 0,
+            excl_count INTEGER NOT NULL DEFAULT 0, consol_saveable INTEGER NOT NULL DEFAULT 0,
+            nonprod_count INTEGER NOT NULL DEFAULT 0, prod_count INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    rows = conn.execute(
+        """SELECT scanned_at, total_ops, attack_count, excl_count,
+                  consol_saveable, nonprod_count, prod_count
+           FROM apm_ops_snapshots
+           WHERE realm=? AND environment=?
+           ORDER BY scanned_at DESC LIMIT ?""",
+        (REALM, environment or "", limit)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Org info
 # ---------------------------------------------------------------------------
 
@@ -432,39 +555,611 @@ def fetch_tokens():
         return []
 
 
-def fetch_metrics(limit=None):
-    """Fetch all metrics with pagination — returns complete list."""
-    metrics = []
-    page_size = 100
-    offset = None
-    fetched = 0
+def fetch_signalflow_last_value(metric_name, lookback_ms=3600000):
+    """
+    Execute a simple SignalFlow program and return the most recent scalar value.
+    Uses the SSE streaming format returned by /v2/signalflow/execute.
+    Returns None if no data or on error.
+    """
+    try:
+        import time as _time
+        now_ms  = int(_time.time() * 1000)
+        program = f"data('{metric_name}').publish()"
+        resp = requests.post(
+            f"https://stream.{REALM}.signalfx.com/v2/signalflow/execute",
+            headers={"X-SF-TOKEN": TOKEN, "Content-Type": "text/plain"},
+            data=program,
+            params={"start": str(now_ms - lookback_ms), "stop": str(now_ms),
+                    "resolution": "300000", "immediate": "true"},
+            stream=True, timeout=20,
+        )
+        # SSE format: multi-line blocks where each line starts with "data: "
+        # Collect consecutive data: lines and join into a JSON object
+        data_lines = []
+        for raw in resp.iter_lines():
+            line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            if line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+            elif data_lines:
+                # End of a block — try to parse accumulated lines
+                try:
+                    obj = json.loads("\n".join(data_lines))
+                    # Look for a data payload with a numeric value
+                    if isinstance(obj.get("data"), list):
+                        for entry in obj["data"]:
+                            if "value" in entry:
+                                resp.close()
+                                return entry["value"]
+                except Exception:
+                    pass
+                data_lines = []
+        resp.close()
+    except Exception:
+        pass
+    return None
 
+
+# Standard APM dimensions that are NOT custom indexed span tags
+_STANDARD_APM_DIMS = frozenset({
+    "sf_service", "service.name",
+    "sf_environment", "deployment.environment",
+    "sf_error", "error",
+    "sf_operation",
+    "sf_httpMethod", "http.method", "http.request.method",
+    "sf_kind", "span.kind",
+    "sf_metric", "sf_dimensionalized", "sf_mms_id",
+    "sf_isInternal", "sf_workflow", "sf_histogramBuckets",
+    "orgId",
+})
+
+# Dimensions Splunk adds as correlated metric values during built-in dimensionalization
+_BUILTIN_CORRELATED_DIM_PATTERNS = frozenset({
+    "service_request_duration_ns_p99", "service.request.duration.ns.p99",
+    "spans_count", "spans.count",
+})
+
+
+def fetch_apm_mms_breakdown(mts_limit=500):
+    """
+    Returns a structured breakdown of APM MMS sources:
+      {
+        "builtin":  [{"mms_id": str, "metrics": [...], "dim_keys": [...], "mts_count": N}],
+        "custom":   [{"tag": str, "metrics": [...], "mts_count": N}],
+        "detector_only": [metric_names not in any sf_mms_id group],
+      }
+    Built-in = sf_mms_id values that only use Splunk-internal dimension keys.
+    Custom   = sf_mms_id groups that include at least one non-standard dim key.
+    """
+    from collections import defaultdict
+    try:
+        r = api_get("/v2/metrictimeseries", params={
+            "query": "_exists_:sf_mms_id",
+            "limit": mts_limit,
+        })
+    except Exception:
+        return {"builtin": [], "custom": [], "detector_only": []}
+
+    # Group by sf_mms_id
+    groups = defaultdict(lambda: {"metrics": set(), "extra_dims": defaultdict(int), "mts_count": 0})
+    for mts in r.get("results", []):
+        dims    = mts.get("dimensions", {})
+        mms_id  = dims.get("sf_mms_id", "unknown")
+        metric  = mts.get("metric", "")
+        groups[mms_id]["metrics"].add(metric)
+        groups[mms_id]["mts_count"] += 1
+        for k in dims:
+            if k not in _STANDARD_APM_DIMS and k not in _BUILTIN_CORRELATED_DIM_PATTERNS:
+                groups[mms_id]["extra_dims"][k] += 1
+
+    builtin, custom = [], []
+    for mms_id, info in groups.items():
+        entry = {
+            "mms_id":    mms_id,
+            "metrics":   sorted(info["metrics"]),
+            "dim_keys":  sorted(info["extra_dims"].keys()),
+            "mts_count": info["mts_count"],
+        }
+        if info["extra_dims"]:
+            custom.append(entry)
+        else:
+            builtin.append(entry)
+
+    builtin.sort(key=lambda x: -x["mts_count"])
+    custom.sort(key=lambda x: -x["mts_count"])
+    return {"builtin": builtin, "custom": custom}
+
+
+# ---------------------------------------------------------------------------
+# APM Operations Analysis — high-cardinality operation name detection
+# ---------------------------------------------------------------------------
+
+def fetch_apm_operations(hard_limit=50000, environment=None, dedup=True):
+    """
+    Paginate /v2/metrictimeseries for all MTS with sf_mms_id and return
+    APM operation records.  The API returns one row per MTS — each unique
+    (sf_operation, sf_service, sf_environment) triple typically has 2–8 MTS
+    (one per metric variant: service.request.count, service.error.count,
+    service.request.duration.ns.p99, etc.).
+
+    dedup=True  (default): return one record per unique (op, svc, env) triple.
+                            Each record includes mts_count (how many MTS that
+                            triple owns) so analysis can report true billing impact.
+    dedup=False:            return every row as-is — one dict per MTS_ID.
+                            Produces output equivalent to the raw engineering
+                            export (same format as GAR3eKDAYAI.txt).
+
+    Returns list of dicts:
+        {"operation": str, "service": str, "environment": str,
+         "mts_id": str, "mts_count": int}
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    query = "_exists_:sf_mms_id"
+    if environment:
+        env_q = f'"{environment}"' if " " in environment else environment
+        query += f" AND sf_environment:{env_q}"
+
+    page_size = 10000
+
+    # ── Page 0: get total count + first page ─────────────────────────────────
+    try:
+        first = api_get("/v2/metrictimeseries", params={
+            "query": query, "limit": page_size, "offset": 0,
+        })
+    except Exception as e:
+        print(f"  Warning: MTS fetch error: {e}")
+        return []
+
+    total_count = first.get("count", 0)
+    first_results = first.get("results", [])
+    if not first_results:
+        return []
+
+    # Clamp to hard_limit
+    fetch_up_to = min(total_count, hard_limit)
+    n_pages     = (fetch_up_to + page_size - 1) // page_size
+    offsets     = [i * page_size for i in range(1, n_pages)]  # page 0 already fetched
+
+    if offsets:
+        print(f"  {total_count:,} MTS found — fetching {n_pages} pages in parallel...", flush=True)
+    if total_count > hard_limit:
+        print(f"  Warning: truncating to hard limit of {hard_limit:,}.", flush=True)
+
+    # ── Fetch remaining pages in parallel ────────────────────────────────────
+    all_pages = [first_results]
+
+    def _fetch_page(offset):
+        return api_get("/v2/metrictimeseries", params={
+            "query": query, "limit": page_size, "offset": offset,
+        }).get("results", [])
+
+    if offsets:
+        workers = min(8, len(offsets))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_fetch_page, off): off for off in offsets}
+            done = 0
+            for fut in as_completed(futures):
+                done += 1
+                try:
+                    all_pages.append(fut.result())
+                except Exception as e:
+                    print(f"  Warning: page fetch error: {e}")
+                print(f"  {done}/{len(offsets)} pages done...", end="\r", flush=True)
+        print()  # newline after progress
+
+    # ── Merge pages ───────────────────────────────────────────────────────────
+    seen: dict = {}
+    ops:  list = []
+
+    for page in all_pages:
+        for mts in page:
+            dims = mts.get("dimensions", {})
+            op   = dims.get("sf_operation", "")
+            svc  = dims.get("sf_service", "")
+            env  = dims.get("sf_environment", "")
+            if not op:
+                continue
+            if dedup:
+                key = (op, svc, env)
+                if key in seen:
+                    seen[key]["mts_count"] += 1
+                else:
+                    rec = {"operation": op, "service": svc, "environment": env,
+                           "mts_id": mts.get("id", ""), "mts_count": 1}
+                    seen[key] = rec
+                    ops.append(rec)
+            else:
+                ops.append({"operation": op, "service": svc, "environment": env,
+                            "mts_id": mts.get("id", ""), "mts_count": 1})
+
+    return ops
+
+
+def parameterize_operation(op):
+    """
+    Replace dynamic path segments with stable placeholders so that
+    /case/33315 and /case/33466 both collapse to /case/{ID}.
+    Returns the normalized pattern string.
+    """
+    # Numeric IDs in path segments
+    op = re.sub(r'/\d{1,20}(?=/|$)', '/{ID}', op)
+    # 32-char hex MD5/content hashes in path segments
+    op = re.sub(r'/[0-9a-fA-F]{32}(?=/|$)', '/{HASH}', op)
+    # Webpack / build-tool chunk hashes:  chunk-ABCDEF12.js
+    op = re.sub(r'chunk-[A-Z0-9]{6,}\.js', 'chunk-{HASH}.js', op, flags=re.IGNORECASE)
+    # Content-hashed static assets:  main.a1b2c3d4.js / styles.ab12ef.css
+    op = re.sub(r'(\.[0-9a-f]{6,}\.(js|css|woff2?|ttf|eot))', '.{HASH}.$2', op, flags=re.IGNORECASE)
+    # ISO date segments in paths:  /api/2026-07-14  →  /api/{DATE}
+    op = re.sub(r'/\d{4}-\d{2}-\d{2}(?=/|$)', '/{DATE}', op)
+    # UUIDs in paths
+    op = re.sub(
+        r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=/|$)',
+        '/{UUID}', op, flags=re.IGNORECASE)
+    # JVM lambda addresses:  $$Lambda$3406/0x...@...
+    op = re.sub(r'\$\$Lambda\$\d+/0x[0-9a-f]+@[0-9a-f]+', '{JVM_LAMBDA}', op, flags=re.IGNORECASE)
+    return op
+
+
+def _fix_parameterize(op):
+    """Wrapper that handles the re.I constant quirk."""
+    op = re.sub(r'/\d{1,20}(?=/|$)', '/{ID}', op)
+    op = re.sub(r'/[0-9a-fA-F]{32}(?=/|$)', '/{HASH}', op)
+    op = re.sub(r'chunk-[A-Z0-9]{6,}\.js', 'chunk-{HASH}.js', op, flags=re.IGNORECASE)
+    op = re.sub(r'\.[0-9a-f]{6,}\.(js|css|woff2?|ttf|eot)', '.{HASH}.\\1', op, flags=re.IGNORECASE)
+    op = re.sub(r'/\d{4}-\d{2}-\d{2}(?=/|$)', '/{DATE}', op)
+    op = re.sub(
+        r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=/|$)',
+        '/{UUID}', op, flags=re.IGNORECASE)
+    op = re.sub(r'\$\$Lambda\$\d+/0x[0-9a-f]+@[0-9a-f]+', '{JVM_LAMBDA}', op, flags=re.IGNORECASE)
+    return op
+
+
+# Split a parameterized pattern on its placeholder tokens
+_PH_SPLIT_RE = re.compile(r'(\{ID\}|\{HASH\}|\{DATE\}|\{UUID\}|\{JVM_LAMBDA\})')
+_PH_RX_MAP = {
+    '{ID}':         r'(\d{1,20})',
+    '{HASH}':       r'([0-9A-Za-z]{6,64})',  # covers both hex and webpack base36 chunk IDs
+    '{DATE}':       r'(\d{4}-\d{2}-\d{2})',
+    '{UUID}':       r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+    '{JVM_LAMBDA}': r'(.+?)',
+}
+
+
+def _pattern_to_extraction_regex(pattern):
+    """
+    Convert a parameterized pattern like '/case/{ID}' to a compiled regex with
+    capture groups, so the actual parameter values can be extracted from raw
+    operation strings.  Returns None when the pattern has no placeholders.
+    """
+    if not _PH_SPLIT_RE.search(pattern):
+        return None
+    parts = _PH_SPLIT_RE.split(pattern)
+    rx_parts = [_PH_RX_MAP[p] if p in _PH_RX_MAP else re.escape(p) for p in parts]
+    try:
+        return re.compile(''.join(rx_parts), re.IGNORECASE)
+    except re.error:
+        return None
+
+
+def analyze_apm_operations(ops):
+    """
+    Run all analysis passes on a list of APM operation records.
+
+    Passes:
+      1. Parameterization — group operations by normalized pattern, surface
+         consolidation opportunities ranked by MTS-saved.
+      2. Security probes — detect attack payloads in operation names.
+      3. Environment distribution — prod vs non-prod MTS count.
+      4. Exclusion candidates — health checks, static assets, swagger,
+         JVM classnames, bare HTTP methods.
+
+    Returns a structured dict consumed by both the text and HTML reporters.
+    """
+    from collections import defaultdict, Counter
+
+    # ── 1. Parameterization groups ────────────────────────────────────────────
+    pattern_groups = defaultdict(list)
+    for op in ops:
+        pattern = _fix_parameterize(op["operation"])
+        pattern_groups[pattern].append(op)
+
+    consolidation = []
+    for pattern, members in pattern_groups.items():
+        if len(members) < 2:
+            continue
+        # True MTS count = sum of per-triple multiplicity (metric variants per operation)
+        total_mts = sum(m.get("mts_count", 1) for m in members)
+        # Extract unique parameter values (e.g. the actual IDs in /case/{ID})
+        rx = _pattern_to_extraction_regex(pattern)
+        unique_vals: set = set()
+        if rx:
+            for op_rec in members:
+                m = rx.search(op_rec["operation"])
+                if m:
+                    unique_vals.update(g for g in m.groups() if g)
+        consolidation.append({
+            "pattern":            pattern,
+            "count":              total_mts,         # true MTS count (billing impact)
+            "unique_ops":         len(members),      # unique (op, svc, env) triples
+            "mts_saved":          total_mts - 1,
+            "unique_values":      len(unique_vals) if unique_vals else len(members),
+            "unique_val_samples": sorted(unique_vals)[:8],
+            "services":           sorted({o["service"]     for o in members if o["service"]}),
+            "environments":       sorted({o["environment"] for o in members if o["environment"]}),
+            "samples":            [o["operation"] for o in members[:4]],
+        })
+    consolidation.sort(key=lambda x: -x["count"])
+
+    # ── 2. Security / probe detection ─────────────────────────────────────────
+    attacks = []
+    for op in ops:
+        for sig_re, label in APM_ATTACK_SIGNATURES:
+            if sig_re.search(op["operation"]):
+                attacks.append({**op, "attack_type": label})
+                break
+
+    # Group attacks by type for summary
+    attack_by_type = defaultdict(list)
+    for a in attacks:
+        attack_by_type[a["attack_type"]].append(a)
+
+    # ── 3. Environment distribution — weighted by true MTS count ─────────────
+    env_counter   = Counter()
+    for op in ops:
+        env_counter[op["environment"]] += op.get("mts_count", 1)
+    total_mts     = sum(env_counter.values())
+    prod_count    = sum(v for k, v in env_counter.items() if k.startswith("prod-"))
+    nonprod_count = sum(v for k, v in env_counter.items() if not k.startswith("prod-"))
+
+    # ── 4. Exclusion candidates ───────────────────────────────────────────────
+    exclusions = defaultdict(list)
+    for op in ops:
+        for cls, cls_re in APM_EXCLUSION_CLASSES.items():
+            if cls_re.search(op["operation"]):
+                exclusions[cls].append(op)
+                break   # one class per op
+
+    # ── Summary stats ─────────────────────────────────────────────────────────
+    total_mts_saveable = sum(c["mts_saved"] for c in consolidation)
+    # Total excl in true MTS (sum mts_count per excluded op)
+    total_excl = sum(
+        sum(op.get("mts_count", 1) for op in members)
+        for members in exclusions.values()
+    )
+    attack_mts = sum(a.get("mts_count", 1) for a in attacks)
+    reduction_pct      = round((total_mts_saveable + attack_mts + total_excl)
+                               / max(total_mts, 1) * 100, 1)
+
+    return {
+        "total":            total_mts,       # true MTS count (billing rows)
+        "total_unique_ops": len(ops),        # unique (op, svc, env) triples
+        "pattern_groups":   len(pattern_groups),
+        "consolidation":    consolidation,
+        "attacks":          attacks,
+        "attack_by_type":   dict(attack_by_type),
+        "env_distribution": dict(env_counter),
+        "prod_count":       prod_count,
+        "nonprod_count":    nonprod_count,
+        "exclusions":       dict(exclusions),
+        "total_mts_saveable":  total_mts_saveable,
+        "total_excl":          total_excl,
+        "reduction_pct":       reduction_pct,
+    }
+
+
+# ---------------------------------------------------------------------------
+# MetricSet classification — MMS (Monitoring) and TMS (Troubleshooting)
+# ---------------------------------------------------------------------------
+
+# APM-generated metric name prefixes → Troubleshooting MetricSets
+_TMS_PREFIXES = (
+    "service.request.", "service.error.", "service.duration.",
+    "spans.", "traces.", "workflows.", "rum.", "sf.org.apm.",
+)
+# APM-specific dimensions that indicate TMS origin
+_TMS_DIMENSIONS = frozenset({
+    "sf_service", "sf_operation", "sf_environment",
+    "service.name", "deployment.environment", "sf_workflow",
+})
+
+
+def fetch_detectors(limit=500):
+    """Fetch all detectors — used to identify which metrics are Monitoring MetricSets.
+
+    The list endpoint does not include programSignalFlowText, so after collecting
+    detector IDs we fetch each full object in parallel via GET /v2/detector/{id}.
+    """
+    # Step 1: collect stubs (id + name) from the paginated list endpoint
+    stubs, offset = [], 0
     while True:
-        params = {"limit": page_size}
-        if offset:
-            params["offset"] = offset
-
         try:
-            result = api_get("/v2/metric", params=params)
-        except Exception as e:
-            print(f"  Warning: metric fetch error: {e}")
+            page = api_get("/v2/detector", params={"limit": 100, "offset": offset})
+        except Exception:
             break
-
-        page = result.get("results", [])
-        metrics.extend(page)
-        fetched += len(page)
-
-        if limit and fetched >= limit:
-            metrics = metrics[:limit]
+        batch = page.get("results", [])
+        if not batch:
             break
-
-        # Check for next page via count vs fetched
-        total = result.get("count", 0)
-        if len(page) < page_size or fetched >= total:
+        stubs.extend(batch)
+        if len(batch) < 100 or len(stubs) >= limit:
             break
+        offset += len(batch)
+    stubs = stubs[:limit]
+    if not stubs:
+        return []
 
-        offset = fetched
+    # Step 2: fetch full detector objects in parallel to retrieve programSignalFlowText
+    def _fetch_one(stub):
+        try:
+            return api_get(f"/v2/detector/{stub['id']}")
+        except Exception:
+            return stub  # fall back to stub on error
 
+    max_workers = int(os.environ.get("SCAN_WORKERS", "10"))
+    full_detectors = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for result in executor.map(_fetch_one, stubs):
+            if result is not None:
+                full_detectors.append(result)
+    return full_detectors
+
+
+def _extract_signalflow_metrics(text):
+    """Return set of metric names referenced in a SignalFlow program via data() calls."""
+    if not text:
+        return set()
+    return set(re.findall(r"""data\(['\"]([^'\"]+)['\"]""", text))
+
+
+def build_detector_metric_map(detectors):
+    """
+    Returns dict: metric_name -> list of {"id": str, "name": str}
+    Uses sf_metricsInObjectProgramText (pre-extracted) when available,
+    otherwise falls back to regex-parsing the programText field.
+    """
+    mmap = defaultdict(list)
+    for det in detectors:
+        det_info = {"id": det.get("id", ""), "name": det.get("name", "?")}
+        # Prefer pre-extracted metric list; fall back to parsing programText
+        pre = det.get("sf_metricsInObjectProgramText")
+        if pre and isinstance(pre, list):
+            metrics_in_det = set(pre)
+        else:
+            sf_text = det.get("programText") or det.get("programSignalFlowText") or det.get("sf_programText") or ""
+            metrics_in_det = _extract_signalflow_metrics(sf_text)
+        for m in metrics_in_det:
+            mmap[m].append(det_info)
+    return dict(mmap)
+
+
+def _extract_tms_context(mts_list):
+    """Pull service/environment context from APM MTS dimensions."""
+    services, envs = set(), set()
+    for mts in mts_list[:200]:
+        dims = mts.get("dimensions", {})
+        svc  = dims.get("sf_service") or dims.get("service.name")
+        env  = dims.get("sf_environment") or dims.get("deployment.environment")
+        if svc:
+            services.add(svc)
+        if env:
+            envs.add(env)
+    return {"services": sorted(services), "environments": sorted(envs)}
+
+
+def classify_metricset_type(metric_name, mts_list, detector_map):
+    """
+    Classify a metric as:
+      MMS — Monitoring MetricSet: used in at least one active detector
+      TMS — Troubleshooting MetricSet: APM-generated high-cardinality metric
+      STD — Standard infrastructure / custom metric
+    Returns (type_str, detail_dict).
+    """
+    if metric_name in detector_map:
+        return "MMS", {"detectors": detector_map[metric_name]}
+
+    if any(metric_name.startswith(p) for p in _TMS_PREFIXES):
+        return "TMS", _extract_tms_context(mts_list)
+
+    # Detect TMS by APM dimensions even when name prefix doesn't match
+    dim_names = set()
+    for mts in mts_list[:50]:
+        dim_names.update(mts.get("dimensions", {}).keys())
+    if dim_names & _TMS_DIMENSIONS:
+        return "TMS", _extract_tms_context(mts_list)
+
+    return "STD", {}
+
+
+def cmd_metricsets(top_n=50):
+    """Print a breakdown of Monitoring and Troubleshooting MetricSets."""
+    print(f"\nMetricSet Breakdown  (realm={REALM})\n")
+    print("  Fetching detectors...")
+    detectors    = fetch_detectors()
+    detector_map = build_detector_metric_map(detectors)
+    print(f"  {len(detectors)} detectors loaded  ·  {len(detector_map)} unique metrics referenced in detector programs\n")
+
+    findings = scan_org(top_n=top_n)
+    if not findings:
+        print("No findings — nothing to classify.")
+        return
+
+    mms = [(f, f["ms_detail"]) for f in findings if f.get("ms_type") == "MMS"]
+    tms = [(f, f["ms_detail"]) for f in findings if f.get("ms_type") == "TMS"]
+    std = [f for f in findings if f.get("ms_type") == "STD"]
+
+    # ── Monitoring MetricSets ──
+    print(f"MONITORING METRICSETS  —  {len(mms)} metrics actively used in detectors\n")
+    if mms:
+        print(f"  {'Metric':<45} {'MTS':>8} {'Severity':<12} {'Detectors'}")
+        print("  " + "─" * 110)
+        for f, detail in sorted(mms, key=lambda x: -x[0]["mts_count"]):
+            dets = detail.get("detectors", [])
+            det_str = ", ".join(d["name"] for d in dets[:3])
+            if len(dets) > 3:
+                det_str += f"  +{len(dets)-3} more"
+            sev_icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}.get(f["severity"], "⚪")
+            print(f"  {f['metric']:<45} {f['mts_count']:>8,} {sev_icon+f['severity']:<14} {det_str or '—'}")
+    else:
+        print("  None of the top findings are used in active detectors.")
+
+    # ── Troubleshooting MetricSets ──
+    print(f"\nTROUBLESHOOTING METRICSETS  —  {len(tms)} APM-generated metrics\n")
+    if tms:
+        print(f"  {'Metric':<45} {'MTS':>8} {'Services':<35} {'Environments'}")
+        print("  " + "─" * 115)
+        for f, detail in sorted(tms, key=lambda x: -x[0]["mts_count"]):
+            svcs = ", ".join(detail.get("services", [])[:3]) or "—"
+            envs = ", ".join(detail.get("environments", [])[:2]) or "—"
+            print(f"  {f['metric']:<45} {f['mts_count']:>8,} {svcs:<35} {envs}")
+    else:
+        print("  No APM-generated (TMS) metrics found in top findings.")
+
+    # ── Summary ──
+    mms_mts = sum(f["mts_count"] for f, _ in mms)
+    tms_mts = sum(f["mts_count"] for f, _ in tms)
+    std_mts = sum(f["mts_count"] for f in std)
+    total   = mms_mts + tms_mts + std_mts
+    print(f"\n{'─'*65}")
+    print(f"  {'MMS (Monitoring):':<26} {len(mms):>4} metrics  {mms_mts:>9,} MTS  ~${mms_mts*MTS_COST_PER_MONTH:,.2f}/mo")
+    print(f"  {'TMS (Troubleshooting):':<26} {len(tms):>4} metrics  {tms_mts:>9,} MTS  ~${tms_mts*MTS_COST_PER_MONTH:,.2f}/mo")
+    print(f"  {'STD (Standard):':<26} {len(std):>4} metrics  {std_mts:>9,} MTS  ~${std_mts*MTS_COST_PER_MONTH:,.2f}/mo")
+    print(f"  {'Total:':<26}       {total:>9,} MTS  ~${total*MTS_COST_PER_MONTH:,.2f}/mo")
+
+
+def fetch_metrics(limit=None):
+    """Fetch all metrics with pagination — returns complete list (pages fetched in parallel)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    page_size = 100
+
+    # Page 0: get total count + first page
+    try:
+        first_result = api_get("/v2/metric", params={"limit": page_size})
+    except Exception as e:
+        print(f"  Warning: metric fetch error: {e}")
+        return []
+
+    first_page = first_result.get("results", [])
+    total = first_result.get("count", 0)
+    fetch_up_to = min(total, limit) if limit else total
+    n_pages = (fetch_up_to + page_size - 1) // page_size
+    offsets = [i * page_size for i in range(1, n_pages)]
+
+    def _fetch_page(offset):
+        try:
+            return api_get("/v2/metric", params={"limit": page_size, "offset": offset}).get("results", [])
+        except Exception:
+            return []
+
+    all_pages = [first_page]
+    if offsets:
+        workers = min(10, len(offsets))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_fetch_page, off): off for off in offsets}
+            for fut in as_completed(futures):
+                all_pages.append(fut.result())
+
+    metrics = [m for page in all_pages for m in page]
+    if limit:
+        metrics = metrics[:limit]
     return metrics
 
 
@@ -626,9 +1321,13 @@ def attribute_to_team(mts_list, tokens):
     services = set()
     for mts in mts_list[:100]:
         dims = mts.get("dimensions", {})
+        metric_name = mts.get("metric", "")
         for key in ["service.name", "service", "sf_service", "team", "owner"]:
             if key in dims:
                 services.add(dims[key])
+        # Label Splunk-internal org metrics explicitly
+        if not services and metric_name.startswith("sf.org."):
+            services.add("splunk-internal")
     return sorted(services) if services else ["unknown"]
 
 
@@ -681,6 +1380,13 @@ def attribute_detail(mts_list):
         elif "telemetry.sdk.name" in dims and "telemetry.sdk.version" in dims:
             sdk_versions.add(f"{dims['telemetry.sdk.name']}:{dims['telemetry.sdk.version']}")
 
+    # Fallback: label Splunk-internal org metrics explicitly
+    if not services:
+        for mts in mts_list[:20]:
+            if mts.get("metric", "").startswith("sf.org."):
+                services.add("splunk-internal")
+                break
+
     return {
         "services":     sorted(services)     or ["unknown"],
         "environments": sorted(environments) or [],
@@ -691,15 +1397,23 @@ def attribute_detail(mts_list):
     }
 
 
-def scan_org(top_n=50, verbose=False):
+def scan_org(top_n=200, verbose=False):
     """
     Full org scan. Returns list of findings sorted by MTS count descending.
     Includes org limit awareness and week-over-week trend tracking.
+    Metrics are analyzed concurrently; set SCAN_WORKERS env var to tune (default: 10).
     """
     print(f"\nScanning org (realm={REALM})...\n")
 
     org    = fetch_org_info()
     tokens = fetch_tokens()
+
+    # Detectors — used for MMS classification (which metrics are actively monitored)
+    print("  Fetching detectors for MetricSet classification...")
+    detectors    = fetch_detectors()
+    detector_map = build_detector_metric_map(detectors)
+    if detector_map:
+        print(f"  {len(detectors)} detectors  ·  {len(detector_map)} metrics referenced in detector programs")
 
     # Org MTS limit awareness
     mts_limit = org.get("mtsCategoryInfo", {}).get("mtsLimitThreshold") \
@@ -721,32 +1435,73 @@ def scan_org(top_n=50, verbose=False):
         print("  No metrics found. Check your token permissions.")
         return []
 
-    print(f"  Found {len(metrics)} metrics. Analyzing top offenders...\n")
+    n = len(metrics)
+    print(f"  Found {n} metrics. Analyzing top offenders...\n")
 
-    findings = []
+    _lock     = threading.Lock()
+    _counter  = [0]
+    _env_mts  = defaultdict(int)   # env_name -> total MTS across all metrics
+    _env_met  = defaultdict(int)   # env_name -> unique metric count
+    _tms_below = []                # below-threshold APM metrics for TMS section
 
-    for i, metric in enumerate(metrics):
+    def _analyze_one(metric):
         name   = metric.get("name", "")
         mtype  = metric.get("type", "gauge")
         custom = metric.get("custom", True)
 
-        if verbose:
-            print(f"  [{i+1}/{len(metrics)}] {name}")
+        # Phase 1: lightweight probe — fetch limit=100 to get true API count + a sample.
+        # This avoids pulling 10k rows for every LOW-severity metric (the vast majority).
+        try:
+            _probe    = api_get("/v2/metrictimeseries", params={"query": f"sf_metric:{name}", "limit": 100})
+            mts_count = _probe.get("count", 0)
+            quick_sample = _probe.get("results", [])
+        except Exception:
+            mts_count    = 0
+            quick_sample = []
 
-        # Fetch MTS for this metric
-        mts_list  = fetch_mts_for_metric(name, limit=10000)
-        mts_count = len(mts_list)
+        with _lock:
+            _counter[0] += 1
+            if verbose:
+                print(f"  [{_counter[0]}/{n}] {name}  ({mts_count} MTS)")
+            else:
+                print(f"\r  Analyzed {_counter[0]}/{n} metrics...", end="", flush=True)
 
         if mts_count == 0:
-            continue
-
-        # Skip ignored metrics
+            return None
         if is_ignored(name, ignored_patterns):
-            continue
+            return None
 
         sev = severity(mts_count)
+
+        # Collect per-environment stats for ALL metrics using the quick sample
+        seen_envs = set()
+        for mts in quick_sample:
+            dims = mts.get("dimensions", {})
+            env  = dims.get("sf_environment") or dims.get("deployment.environment")
+            if env:
+                seen_envs.add(env)
+        with _lock:
+            for env in seen_envs:
+                _env_mts[env] += mts_count
+                _env_met[env] += 1
+
         if sev == "LOW" and not verbose:
-            continue
+            # Use quick_sample for APM detection — no full fetch needed
+            has_svc = any(
+                mts.get("dimensions", {}).get("sf_service") or
+                mts.get("dimensions", {}).get("service.name")
+                for mts in quick_sample[:20]
+            )
+            if has_svc:
+                detail = _extract_tms_context(quick_sample)
+                if detail.get("services") or detail.get("environments"):
+                    with _lock:
+                        _tms_below.append({"metric": name, "mts_count": mts_count,
+                                           "severity": "LOW", "detail": detail})
+            return None
+
+        # Phase 2: MEDIUM+ metrics only — fetch full MTS for dimension analysis
+        mts_list = fetch_mts_for_metric(name, limit=10000)
 
         # Trend: compare to previous scan
         prev_count, prev_ts = db_get_previous(name)
@@ -779,7 +1534,8 @@ def scan_org(top_n=50, verbose=False):
             if drop_pct >= REMEDIATION_DROP_PCT and not db_is_resolved(name):
                 db_mark_resolved(name, peak_mts, peak_at, mts_count, manual=False)
                 auto_resolved = True
-                print(f"  [RESOLVED] {name}: {peak_mts:,} → {mts_count:,} MTS (-{int(drop_pct*100)}%)")
+                with _lock:
+                    print(f"\n  [RESOLVED] {name}: {peak_mts:,} → {mts_count:,} MTS (-{int(drop_pct*100)}%)")
 
         # MTS limit % contribution
         limit_pct = round(mts_count / mts_limit * 100, 2) if mts_limit else None
@@ -790,53 +1546,74 @@ def scan_org(top_n=50, verbose=False):
         attribution   = attribute_detail(mts_list)
         instr_source, instr_desc = infer_instrumentation_source(name, mts_list)
 
+        # MetricSet classification: MMS (used in detectors), TMS (APM-generated), STD
+        ms_type, ms_detail = classify_metricset_type(name, mts_list, detector_map)
+
         # Find worst offending dimension
-        worst_dim      = None
-        worst_dim_info = None
+        worst_dim = worst_dim_info = None
         for dim, info in dim_analysis.items():
             if worst_dim is None or info["unique_values"] > worst_dim_info["unique_values"]:
                 worst_dim      = dim
                 worst_dim_info = info
 
-        findings.append({
-            "metric":         name,
-            "type":           mtype,
-            "custom":         custom,
-            "mts_count":      mts_count,
-            "severity":       sev,
-            "dimensions":     dim_analysis,
-            "worst_dim":      worst_dim,
-            "worst_dim_info": worst_dim_info,
-            "attributed_to":  attributed_to,
-            "instr_source":   instr_source,
-            "instr_desc":     instr_desc,
-            "attribution":    attribution,
-            "prev_count":     prev_count,
-            "prev_ts":        prev_ts,
-            "growth_pct":     growth_pct,
-            "trend":          trend,
-            "limit_pct":      limit_pct,
-            "auto_resolved":  auto_resolved,
-            "peak_mts":       peak_mts,
-            "peak_at":        peak_at,
-            "anomaly":        anomaly,
-            "baseline_ratio": baseline_ratio,
+        return {
+            "metric":           name,
+            "type":             mtype,
+            "custom":           custom,
+            "mts_count":        mts_count,
+            "severity":         sev,
+            "dimensions":       dim_analysis,
+            "worst_dim":        worst_dim,
+            "worst_dim_info":   worst_dim_info,
+            "attributed_to":    attributed_to,
+            "instr_source":     instr_source,
+            "instr_desc":       instr_desc,
+            "attribution":      attribution,
+            "prev_count":       prev_count,
+            "prev_ts":          prev_ts,
+            "growth_pct":       growth_pct,
+            "trend":            trend,
+            "limit_pct":        limit_pct,
+            "auto_resolved":    auto_resolved,
+            "peak_mts":         peak_mts,
+            "peak_at":          peak_at,
+            "anomaly":          anomaly,
+            "baseline_ratio":   baseline_ratio,
             "baseline_samples": baseline_samples if baseline_avg else 0,
-        })
+            "ms_type":          ms_type,
+            "ms_detail":        ms_detail,
+        }
+
+    max_workers = int(os.environ.get("SCAN_WORKERS", "25"))
+    findings = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for result in executor.map(_analyze_one, metrics):
+            if result is not None:
+                findings.append(result)
+
+    if not verbose:
+        print()  # newline after progress line
+
+    # Publish scan stats for use by generate_html_report
+    global _scan_env_stats, _scan_tms_below
+    _scan_env_stats  = {env: {"mts": _env_mts[env], "metrics": _env_met[env]}
+                        for env in sorted(_env_mts, key=lambda e: -_env_mts[e])}
+    _scan_tms_below  = sorted(_tms_below, key=lambda x: -x["mts_count"])
 
     # Sort by MTS count descending
     findings.sort(key=lambda x: -x["mts_count"])
     top = findings[:top_n]
 
-    # Persist results for next run's trend comparison
-    db_save_scan(top)
+    # Persist ALL findings (not just top-N) so metrics that fall off the display
+    # list still have history for trend tracking and anomaly detection next run.
+    db_save_scan(findings)
 
     # Save scan summary for history tracking
-    n_critical = sum(1 for f in top if f["severity"] == "CRITICAL")
-    n_high     = sum(1 for f in top if f["severity"] == "HIGH")
-    n_medium   = sum(1 for f in top if f["severity"] == "MEDIUM")
+    n_critical = sum(1 for f in findings if f["severity"] == "CRITICAL")
+    n_high     = sum(1 for f in findings if f["severity"] == "HIGH")
+    n_medium   = sum(1 for f in findings if f["severity"] == "MEDIUM")
     n_ignored  = sum(1 for m in metrics if is_ignored(m.get("name", ""), ignored_patterns))
-    db_save_summary(len(metrics), sum(f["mts_count"] for f in top), n_critical, n_high, n_medium, n_ignored)
+    db_save_summary(len(metrics), sum(f["mts_count"] for f in findings), n_critical, n_high, n_medium, n_ignored)
 
     return top
 
@@ -1051,8 +1828,11 @@ def generate_report(findings, use_claude=True):
     service_mts = defaultdict(int)
     service_metrics = defaultdict(set)
     for f in findings:
-        for svc in f.get("attribution", {}).get("services", f["attributed_to"]):
-            service_mts[svc] += f["mts_count"]
+        svcs = f.get("attribution", {}).get("services", f["attributed_to"])
+        n    = max(1, len(svcs))
+        per_svc = max(1, f["mts_count"] // n)
+        for svc in svcs:
+            service_mts[svc] += per_svc
             service_metrics[svc].add(f["metric"])
 
     if service_mts:
@@ -1232,90 +2012,7 @@ def _trend_badge(trend, growth_pct=None):
     return f'<span class="badge" style="background:{c}">{icon} {_h(label)}</span>'
 
 
-def generate_html_report(findings, use_claude=True):
-    """Generate a self-contained HTML report matching the o11y-adoption design."""
-    REPORTS_DIR.mkdir(exist_ok=True)
-    ts      = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    outpath = REPORTS_DIR / f"cardinality_report_{ts}.html"
-
-    total_mts  = sum(f["mts_count"] for f in findings)
-    total_cost = total_mts * MTS_COST_PER_MONTH
-    critical   = [f for f in findings if f["severity"] == "CRITICAL"]
-    high       = [f for f in findings if f["severity"] == "HIGH"]
-    medium     = [f for f in findings if f["severity"] == "MEDIUM"]
-
-    org = fetch_org_info()
-    mts_limit = org.get("mtsCategoryInfo", {}).get("mtsLimitThreshold") \
-             or org.get("mtsLimit") or org.get("numResourcesMonitored")
-    pct_used = round(total_mts / mts_limit * 100, 1) if mts_limit else None
-
-    all_resolved    = db_get_resolved()
-    ignored_patterns = db_get_ignored()
-    saved_mts  = sum(r[1] - r[3] for r in all_resolved) if all_resolved else 0
-    saved_cost = saved_mts * MTS_COST_PER_MONTH
-
-    growing     = [f for f in findings if f.get("trend") == "GROWING"]
-    new_metrics = [f for f in findings if f.get("trend") == "NEW"]
-    anomalies   = [f for f in findings if f.get("anomaly")]
-
-    # Health grade: penalise weighted by log10(mts_count) so large explosions hurt more
-    import math as _math
-    def _penalty(finding_list, flat):
-        return sum(flat * max(1.0, _math.log10(max(1, f["mts_count"]))) for f in finding_list)
-    _score = 100
-    _score -= _penalty(critical, 6)
-    _score -= _penalty(high,     3)
-    _score -= _penalty(medium,   1)
-    _score -= _penalty(growing,  2)
-    health_score = max(0, min(100, round(_score)))
-    grade        = "A" if health_score >= 80 else "B" if health_score >= 65 else "C" if health_score >= 50 else "D" if health_score >= 35 else "F"
-    grade_color  = {"A": "#22c55e", "B": "#84cc16", "C": "#eab308", "D": "#f97316", "F": "#ef4444"}[grade]
-
-    # Recommended actions
-    def _recommended_actions():
-        actions = []
-        for f in critical[:5]:
-            cost = f["mts_count"] * MTS_COST_PER_MONTH
-            actions.append({"priority": "critical", "category": "Cardinality",
-                            "action": f"Fix CRITICAL metric: {f['metric']}",
-                            "detail": f"{f['mts_count']:,} MTS · ~${cost:,.2f}/mo · worst dim: {f['worst_dim'] or '?'}"})
-        if growing:
-            actions.append({"priority": "high", "category": "Trend",
-                            "action": f"Investigate {len(growing)} metric(s) growing >20%",
-                            "detail": ", ".join(f["metric"] for f in growing[:3])})
-        if anomalies:
-            actions.append({"priority": "high", "category": "Anomaly",
-                            "action": f"{len(anomalies)} metric(s) growing faster than 7-day baseline",
-                            "detail": ", ".join(f["metric"] for f in anomalies[:3])})
-        for f in high[:3]:
-            actions.append({"priority": "high", "category": "Cardinality",
-                            "action": f"Remediate HIGH metric: {f['metric']}",
-                            "detail": f"{f['mts_count']:,} MTS · worst dim: {f['worst_dim'] or '?'}"})
-        if pct_used and pct_used > 80:
-            actions.append({"priority": "critical", "category": "Capacity",
-                            "action": f"Org MTS at {pct_used}% of limit — immediate action required",
-                            "detail": f"{total_mts:,} / {mts_limit:,} MTS"})
-        if medium:
-            actions.append({"priority": "medium", "category": "Cardinality",
-                            "action": f"Plan remediation for {len(medium)} MEDIUM metric(s)",
-                            "detail": "Address in next sprint"})
-        return actions
-
-    actions = _recommended_actions()
-
-    # Service scorecard (computed early, used in multiple sections)
-    service_mts     = defaultdict(int)
-    service_metrics = defaultdict(set)
-    for f in findings:
-        for svc in f.get("attribution", {}).get("services", f["attributed_to"]):
-            service_mts[svc]     += f["mts_count"]
-            service_metrics[svc].add(f["metric"])
-
-    # Scan history for trend section
-    scan_history = db_get_scan_history(limit=10)
-
-    # ---- CSS ----
-    css = """
+_REPORT_CSS = """
     :root {
       --bg: #f1f5f9; --surface: #fff; --border: #e2e8f0; --text: #1e293b;
       --muted: #64748b; --subtle: #94a3b8; --hover: #f8fafc; --input-bg: #fff;
@@ -1399,6 +2096,12 @@ def generate_html_report(findings, use_claude=True):
     }
     .copy-yaml-btn:hover { background: var(--border); color: var(--text); }
     .savings-bar { height: 8px; border-radius: 4px; background: #22c55e; display: inline-block; min-width: 2px; }
+    .pills-more-btn {
+      display: inline-block; font-size: 11px; padding: 1px 6px; margin: 1px 2px;
+      border-radius: 5px; border: 1px solid var(--border); background: var(--hover);
+      color: var(--muted); cursor: pointer; white-space: nowrap; vertical-align: middle;
+    }
+    .pills-more-btn:hover { background: var(--border); color: var(--text); }
     #search-box {
       width: 100%; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px;
       font-size: 12px; background: var(--input-bg); color: var(--text); margin-bottom: 8px;
@@ -1437,8 +2140,7 @@ def generate_html_report(findings, use_claude=True):
     }
     """
 
-    # ---- JS ----
-    js = """
+_REPORT_JS = """
     function toggleDark() {
       const html = document.documentElement;
       html.dataset.theme = html.dataset.theme === 'dark' ? 'light' : 'dark';
@@ -1482,6 +2184,14 @@ def generate_html_report(findings, use_claude=True):
         nav.appendChild(a);
       });
     });
+    function togglePillsExtra(btn) {
+      const uid = btn.dataset.uid;
+      const extra = document.getElementById(uid);
+      if (!extra) return;
+      const visible = extra.style.display === 'none';
+      extra.style.display = visible ? '' : 'none';
+      btn.textContent = visible ? '▲ less' : '+' + btn.dataset.count + ' more';
+    }
     // Table sorting
     document.addEventListener('click', e => {
       const th = e.target.closest('th[data-sort]');
@@ -1505,6 +2215,129 @@ def generate_html_report(findings, use_claude=True):
         .forEach(r => tbody.appendChild(r));
     });
     """
+
+
+def generate_html_report(findings, use_claude=True, detector_map=None):
+    """Generate a self-contained HTML report matching the o11y-adoption design."""
+    REPORTS_DIR.mkdir(exist_ok=True)
+    ts      = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    outpath = REPORTS_DIR / f"cardinality_report_{ts}.html"
+
+    total_mts  = sum(f["mts_count"] for f in findings)
+    total_cost = total_mts * MTS_COST_PER_MONTH
+    critical   = [f for f in findings if f["severity"] == "CRITICAL"]
+    high       = [f for f in findings if f["severity"] == "HIGH"]
+    medium     = [f for f in findings if f["severity"] == "MEDIUM"]
+
+    org = fetch_org_info()
+    mts_limit = org.get("mtsCategoryInfo", {}).get("mtsLimitThreshold") \
+             or org.get("mtsLimit") or org.get("numResourcesMonitored")
+    pct_used = round(total_mts / mts_limit * 100, 1) if mts_limit else None
+
+    all_resolved    = db_get_resolved()
+    ignored_patterns = db_get_ignored()
+    saved_mts  = sum(r[1] - r[3] for r in all_resolved) if all_resolved else 0
+    saved_cost = saved_mts * MTS_COST_PER_MONTH
+
+    growing     = [f for f in findings if f.get("trend") == "GROWING"]
+    new_metrics = [f for f in findings if f.get("trend") == "NEW"]
+    anomalies   = [f for f in findings if f.get("anomaly")]
+
+    # Health grade: penalise weighted by log10(mts_count) so large explosions hurt more
+    import math as _math
+    def _penalty(finding_list, flat):
+        return sum(flat * max(1.0, _math.log10(max(1, f["mts_count"]))) for f in finding_list)
+    _score = 100
+    _score -= _penalty(critical, 6)
+    _score -= _penalty(high,     3)
+    _score -= _penalty(medium,   1)
+    _score -= _penalty(growing,  2)
+    health_score = max(0, min(100, round(_score)))
+    grade        = "A" if health_score >= 80 else "B" if health_score >= 65 else "C" if health_score >= 50 else "D" if health_score >= 35 else "F"
+    grade_color  = {"A": "#22c55e", "B": "#84cc16", "C": "#eab308", "D": "#f97316", "F": "#ef4444"}[grade]
+
+    # Recommended actions
+    def _recommended_actions():
+        actions = []
+        for f in critical[:5]:
+            cost = f["mts_count"] * MTS_COST_PER_MONTH
+            actions.append({"priority": "critical", "category": "Cardinality",
+                            "action": f"Fix CRITICAL metric: {f['metric']}",
+                            "detail": f"{f['mts_count']:,} MTS · ~${cost:,.2f}/mo · worst dim: {f['worst_dim'] or '?'}"})
+        if growing:
+            actions.append({"priority": "high", "category": "Trend",
+                            "action": f"Investigate {len(growing)} metric(s) growing >20%",
+                            "detail": ", ".join(f["metric"] for f in growing[:3])})
+        if anomalies:
+            actions.append({"priority": "high", "category": "Anomaly",
+                            "action": f"{len(anomalies)} metric(s) growing faster than 7-day baseline",
+                            "detail": ", ".join(f["metric"] for f in anomalies[:3])})
+        for f in high[:3]:
+            actions.append({"priority": "high", "category": "Cardinality",
+                            "action": f"Remediate HIGH metric: {f['metric']}",
+                            "detail": f"{f['mts_count']:,} MTS · worst dim: {f['worst_dim'] or '?'}"})
+        if pct_used and pct_used > 80:
+            actions.append({"priority": "critical", "category": "Capacity",
+                            "action": f"Org MTS at {pct_used}% of limit — immediate action required",
+                            "detail": f"{total_mts:,} / {mts_limit:,} MTS"})
+        if medium:
+            actions.append({"priority": "medium", "category": "Cardinality",
+                            "action": f"Plan remediation for {len(medium)} MEDIUM metric(s)",
+                            "detail": "Address in next sprint"})
+        return actions
+
+    actions = _recommended_actions()
+
+    # ── Environment color palette ──────────────────────────────────────────
+    _ENV_PALETTE = [
+        "#3b82f6",  # blue
+        "#22c55e",  # green
+        "#f97316",  # orange
+        "#8b5cf6",  # purple
+        "#ef4444",  # red
+        "#06b6d4",  # cyan
+        "#ec4899",  # pink
+        "#eab308",  # yellow
+        "#84cc16",  # lime
+        "#14b8a6",  # teal
+    ]
+    # Gather all known environments from findings + scan stats
+    _all_envs = set()
+    for f in findings:
+        for e in f.get("attribution", {}).get("environments", []):
+            _all_envs.add(e)
+    for e in _scan_env_stats:
+        _all_envs.add(e)
+    env_to_color = {env: _ENV_PALETTE[i % len(_ENV_PALETTE)]
+                    for i, env in enumerate(sorted(_all_envs))}
+
+    # Map each service to its primary env (first one found)
+    service_to_env: dict = {}
+    for f in findings:
+        attr = f.get("attribution", {})
+        envs = attr.get("environments", [])
+        for svc in attr.get("services", f.get("attributed_to", [])):
+            if svc not in service_to_env and envs:
+                service_to_env[svc] = envs[0]
+
+    # Service scorecard (computed early, used in multiple sections)
+    # Use proportional attribution: split MTS evenly across services on a metric
+    # so a metric shared by 7 services doesn't inflate each service's total 7×.
+    service_mts     = defaultdict(int)
+    service_metrics = defaultdict(set)
+    for f in findings:
+        svcs = f.get("attribution", {}).get("services", f["attributed_to"])
+        n    = max(1, len(svcs))
+        per_svc = max(1, f["mts_count"] // n)
+        for svc in svcs:
+            service_mts[svc]     += per_svc
+            service_metrics[svc].add(f["metric"])
+
+    # Scan history for trend section
+    scan_history = db_get_scan_history(limit=10)
+
+    css = _REPORT_CSS
+    js  = _REPORT_JS
 
     # ---- Build HTML sections ----
 
@@ -1611,16 +2444,59 @@ def generate_html_report(findings, use_claude=True):
             html += f'<div style="background:#22c55e22;border:1px solid #22c55e66;border-radius:8px;padding:10px 14px;margin-top:8px;font-size:12px;color:var(--text)">✅ <strong>Cumulative savings:</strong> {saved_mts:,} MTS / ~${saved_cost:,.2f}/mo across {len(all_resolved)} resolved metric(s)</div>'
         return html
 
-    def _pills(values, color):
-        """Render a list of values as small coloured pills."""
+    _pill_uid_counter = [0]
+
+    def _one_pill(v, color):
+        return (f'<span style="display:inline-block;background:{color}22;border:1px solid {color}55;'
+                f'border-radius:5px;padding:1px 7px;margin:1px 2px;font-size:11px;color:{color};white-space:nowrap">'
+                f'{_h(v)}</span>')
+
+    def _pills(values, color, max_visible=None):
+        """Render a list of values as small coloured pills, with expandable overflow."""
         if not values:
             return '<span style="color:var(--subtle);font-size:11px">—</span>'
-        return "".join(
-            f'<span style="display:inline-block;background:{color}22;border:1px solid {color}55;'
-            f'border-radius:5px;padding:1px 7px;margin:1px 2px;font-size:11px;color:{color};white-space:nowrap">'
-            f'{_h(v)}</span>'
-            for v in values
-        )
+        if max_visible is None or len(values) <= max_visible:
+            return "".join(_one_pill(v, color) for v in values)
+        _pill_uid_counter[0] += 1
+        uid   = f"pills-{_pill_uid_counter[0]}"
+        count = len(values) - max_visible
+        vis   = "".join(_one_pill(v, color) for v in values[:max_visible])
+        hid   = "".join(_one_pill(v, color) for v in values[max_visible:])
+        return (f'{vis}<span id="{uid}" style="display:none">{hid}</span>'
+                f'<button class="pills-more-btn" onclick="togglePillsExtra(this)" '
+                f'data-uid="{uid}" data-count="{count}">+{count} more</button>')
+
+    def _service_pills(services, max_visible=None):
+        """Render service pills coloured by their environment."""
+        if not services:
+            return '<span style="color:var(--subtle);font-size:11px">—</span>'
+        color_fn = lambda s: env_to_color.get(service_to_env.get(s, ""), "#3b82f6")
+        if max_visible is None or len(services) <= max_visible:
+            return "".join(_one_pill(s, color_fn(s)) for s in services)
+        _pill_uid_counter[0] += 1
+        uid   = f"pills-{_pill_uid_counter[0]}"
+        count = len(services) - max_visible
+        vis   = "".join(_one_pill(s, color_fn(s)) for s in services[:max_visible])
+        hid   = "".join(_one_pill(s, color_fn(s)) for s in services[max_visible:])
+        return (f'{vis}<span id="{uid}" style="display:none">{hid}</span>'
+                f'<button class="pills-more-btn" onclick="togglePillsExtra(this)" '
+                f'data-uid="{uid}" data-count="{count}">+{count} more</button>')
+
+    def _env_pills(envs, max_visible=None):
+        """Render environment pills using the env color palette."""
+        if not envs:
+            return '<span style="color:var(--subtle);font-size:11px">—</span>'
+        color_fn = lambda e: env_to_color.get(e, "#22c55e")
+        if max_visible is None or len(envs) <= max_visible:
+            return "".join(_one_pill(e, color_fn(e)) for e in envs)
+        _pill_uid_counter[0] += 1
+        uid   = f"pills-{_pill_uid_counter[0]}"
+        count = len(envs) - max_visible
+        vis   = "".join(_one_pill(e, color_fn(e)) for e in envs[:max_visible])
+        hid   = "".join(_one_pill(e, color_fn(e)) for e in envs[max_visible:])
+        return (f'{vis}<span id="{uid}" style="display:none">{hid}</span>'
+                f'<button class="pills-more-btn" onclick="togglePillsExtra(this)" '
+                f'data-uid="{uid}" data-count="{count}">+{count} more</button>')
 
     # Top offenders table
     def offenders_table(rows, limit=None):
@@ -1657,9 +2533,9 @@ def generate_html_report(findings, use_claude=True):
             h += f'<td>{_trend_badge(f.get("trend",""), f.get("growth_pct"))}</td>'
             h += f'<td style="font-size:11px;color:var(--muted)">{_h(f["instr_source"])}</td>'
             h += f'<td><span class="dim-name">{_h(worst)}</span> <span style="color:var(--muted);font-size:11px">({worst_count:,})</span></td>'
-            h += f'<td>{_pills(services[:3], "#3b82f6")}</td>'
-            h += f'<td class="col-extra">{_pills(envs[:3], "#22c55e")}</td>'
-            h += f'<td class="col-extra">{_pills(clus_ns[:3], "#8b5cf6")}</td>'
+            h += f'<td>{_service_pills(services, 3)}</td>'
+            h += f'<td class="col-extra">{_env_pills(envs, 3)}</td>'
+            h += f'<td class="col-extra">{_pills(clus_ns, "#8b5cf6", 3)}</td>'
             h += '</tr>'
         h += '</tbody></table></div>'
         return h
@@ -1680,10 +2556,11 @@ def generate_html_report(findings, use_claude=True):
     def scorecard_table():
         h = '<table><thead><tr><th data-sort>Rank</th><th data-sort>Service</th>'
         h += '<th data-sort>Total MTS</th><th data-sort>Est. Cost/Mo</th>'
-        h += '<th data-sort>Metrics</th><th data-sort>% of Total</th>'
+        h += '<th data-sort>Metrics</th><th data-sort>% of Org</th>'
         h += '<th>Environments</th><th>Cluster / NS</th></tr></thead><tbody>'
         for rank, (svc, svc_total) in enumerate(sorted(service_mts.items(), key=lambda x: -x[1]), 1):
-            pct       = round(svc_total / total_mts * 100, 1) if total_mts else 0
+            denom     = mts_limit or total_mts
+            pct       = round(svc_total / denom * 100, 1) if denom else 0
             cost      = svc_total * MTS_COST_PER_MONTH
             n_metrics = len(service_metrics[svc])
             bar       = f'<div style="height:6px;background:#3b82f6;width:{min(pct*2,100)}%;border-radius:3px;margin-top:4px"></div>'
@@ -1694,8 +2571,8 @@ def generate_html_report(findings, use_claude=True):
             h += f'<td data-val="{cost}">~${cost:,.2f}</td>'
             h += f'<td>{n_metrics}</td>'
             h += f'<td data-val="{pct}">{pct}%{bar}</td>'
-            h += f'<td>{_pills(envs[:4], "#22c55e")}</td>'
-            h += f'<td>{_pills(clus_ns[:3], "#8b5cf6")}</td>'
+            h += f'<td>{_env_pills(envs, 4)}</td>'
+            h += f'<td>{_pills(clus_ns, "#8b5cf6", 3)}</td>'
             h += '</tr>'
         h += '</tbody></table>'
         return h
@@ -1847,13 +2724,13 @@ def generate_html_report(findings, use_claude=True):
                         f'letter-spacing:.05em;color:var(--subtle);margin-bottom:6px">{label}</div>'
                         f'{content}</div>')
 
-            h += _ctx_cell("Services",     _pills(services,   "#3b82f6") if services  != ["unknown"] else '<span style="color:var(--subtle);font-size:11px">unknown</span>')
-            h += _ctx_cell("Environments", _pills(envs,       "#22c55e") if envs       else '<span style="color:var(--subtle);font-size:11px">not detected</span>')
-            h += _ctx_cell("Clusters",     _pills(clusters,   "#8b5cf6") if clusters   else '<span style="color:var(--subtle);font-size:11px">not detected</span>')
+            h += _ctx_cell("Services",     _service_pills(services) if services != ["unknown"] else '<span style="color:var(--subtle);font-size:11px">unknown</span>')
+            h += _ctx_cell("Environments", _env_pills(envs)    if envs     else '<span style="color:var(--subtle);font-size:11px">not detected</span>')
+            h += _ctx_cell("Clusters",     _pills(clusters, "#8b5cf6") if clusters else '<span style="color:var(--subtle);font-size:11px">not detected</span>')
             if namespaces:
                 h += _ctx_cell("Namespaces", _pills(namespaces, "#6366f1"))
             if pods:
-                h += _ctx_cell(f"Sample Pods ({len(pods)})", _pills(pods, "#f97316"))
+                h += _ctx_cell(f"Sample Pods ({len(pods)})", _pills(pods, "#f97316", 5))
 
             # Instrumentation source cell
             h += _ctx_cell("Instrumentation",
@@ -2066,16 +2943,339 @@ def generate_html_report(findings, use_claude=True):
                 f'</tr></thead><tbody>{rows}</tbody></table>')
         return _card(f"Scan History ({len(scan_history)} scans)", body, anchor="sec-history", open_by_default=True)
 
+    # MetricSet breakdown section
+    def _metricset_breakdown_html():
+        # Use passed-in detector_map or auto-fetch it now
+        dmap = detector_map
+        if dmap is None:
+            try:
+                dets = fetch_detectors()
+                dmap = build_detector_metric_map(dets)
+            except Exception:
+                dmap = {}
+
+        finding_by_metric = {f["metric"]: f for f in findings}
+
+        # MMS = every metric referenced in at least one detector (regardless of cardinality)
+        mms_rows = []
+        for metric, dets_info in dmap.items():
+            f    = finding_by_metric.get(metric)
+            mts  = f["mts_count"] if f else None
+            sev  = f["severity"]  if f else None
+            mms_rows.append((metric, mts, sev, dets_info))
+        mms_rows.sort(key=lambda x: -(x[1] or 0))
+
+        # TMS from findings (above threshold)
+        tms_findings = [(f, f.get("ms_detail", {})) for f in findings if f.get("ms_type") == "TMS"]
+
+        # Include below-threshold APM metrics collected during scan_org
+        # These cover ALL metrics with service dimensions, regardless of prefix
+        finding_metrics = {f["metric"] for f in findings}
+        extra_tms = [
+            ({"metric": e["metric"], "mts_count": e["mts_count"], "severity": "LOW"}, e["detail"])
+            for e in _scan_tms_below
+            if e["metric"] not in finding_metrics and e["metric"] not in dmap
+        ]
+
+        def _pill(text, bg, fg):
+            return (f'<span style="display:inline-block;background:{bg};border:1px solid {fg}44;'
+                    f'border-radius:5px;padding:1px 7px;margin:1px 2px;font-size:11px;color:{fg};white-space:nowrap">'
+                    f'{_h(text)}</span>')
+
+        out = ""
+
+        # ── Monitoring MetricSets ──
+        # Get actual APM MMS count from Splunk org metrics for comparison
+        apm_mms_count = fetch_signalflow_last_value("sf.org.apm.numMonitoringMetricSets")
+
+        mms_mts  = sum(r[1] for r in mms_rows if r[1] is not None)
+        mms_cost = mms_mts * MTS_COST_PER_MONTH
+        # Fetch APM MMS breakdown (built-in dimensionalization + custom indexed tags)
+        apm_breakdown  = fetch_apm_mms_breakdown()
+        gap_html       = ""
+        breakdown_html = ""
+        if apm_mms_count is not None:
+            apm_mms_int = int(apm_mms_count)
+            gap         = apm_mms_int - len(mms_rows)
+            gap_html    = (f' &nbsp;·&nbsp; <span style="color:#f97316;font-weight:600">'
+                           f'{apm_mms_int} actual APM MMS</span>'
+                           + (f' <span style="color:var(--muted)">(+{gap} from indexed tags / APM built-in)</span>'
+                              if gap > 0 else ""))
+
+        # Build gap breakdown section
+        builtin_groups = apm_breakdown.get("builtin", [])
+        custom_groups  = apm_breakdown.get("custom", [])
+        if builtin_groups or custom_groups:
+            bd = (f'<div style="margin:14px 0 6px;padding:12px 14px;background:var(--hover);'
+                  f'border-radius:8px;border:1px solid var(--border)">')
+            bd += (f'<div style="font-size:12px;font-weight:700;color:var(--text);margin-bottom:10px">'
+                   f'APM MMS Gap Breakdown</div>')
+
+            if custom_groups:
+                bd += (f'<div style="font-size:11px;font-weight:600;color:#f97316;margin-bottom:6px">'
+                       f'Custom Indexed Span Tags ({len(custom_groups)} tag group(s))</div>')
+                bd += '<table style="font-size:11px"><thead><tr><th>Indexed Tag</th><th>Metrics Using It</th><th style="text-align:right">MTS</th></tr></thead><tbody>'
+                for grp in custom_groups:
+                    tags    = ", ".join(f'<code>{_h(t)}</code>' for t in grp["dim_keys"])
+                    metrics = ", ".join(f'<code>{_h(m)}</code>' for m in grp["metrics"][:5])
+                    if len(grp["metrics"]) > 5:
+                        metrics += f' <span style="color:var(--muted)">+{len(grp["metrics"])-5} more</span>'
+                    bd += (f'<tr><td style="padding:3px 8px">{tags}</td>'
+                           f'<td style="padding:3px 8px">{metrics}</td>'
+                           f'<td style="padding:3px 8px;text-align:right">{grp["mts_count"]:,}</td></tr>')
+                bd += '</tbody></table>'
+            else:
+                bd += (f'<div style="font-size:11px;color:var(--muted);margin-bottom:8px">'
+                       f'No custom indexed span tags found. '
+                       f'Gap is from Splunk APM built-in dimensionalization.</div>')
+
+            if builtin_groups:
+                bd += (f'<div style="font-size:11px;font-weight:600;color:#3b82f6;margin:10px 0 6px">'
+                       f'APM Built-in Dimensionalization ({len(builtin_groups)} group(s))</div>')
+                bd += '<table style="font-size:11px"><thead><tr><th>Group ID</th><th>Metric Names</th><th style="text-align:right">MTS</th></tr></thead><tbody>'
+                for grp in builtin_groups:
+                    metrics = ", ".join(f'<code>{_h(m)}</code>' for m in grp["metrics"][:6])
+                    if len(grp["metrics"]) > 6:
+                        metrics += f' <span style="color:var(--muted)">+{len(grp["metrics"])-6} more</span>'
+                    bd += (f'<tr><td style="padding:3px 8px"><code style="font-size:10px">{_h(grp["mms_id"])}</code></td>'
+                           f'<td style="padding:3px 8px">{metrics}</td>'
+                           f'<td style="padding:3px 8px;text-align:right">{grp["mts_count"]:,}</td></tr>')
+                bd += '</tbody></table>'
+                bd += (f'<div style="font-size:10px;color:var(--muted);margin-top:6px">'
+                       f'Built-in groups add sf_httpMethod, sf_kind, and correlated metric dimensions '
+                       f'to standard service/spans metrics. Reduce by disabling APM dimensionalization in org settings.</div>')
+
+            bd += '</div>'
+            breakdown_html = bd
+
+        out += (f'<div style="margin-bottom:6px">'
+                f'<span style="font-size:12px;font-weight:700;color:#3b82f6">Monitoring MetricSets (MMS)</span>'
+                f'<span style="font-size:11px;color:var(--muted);margin-left:10px">'
+                f'{len(mms_rows)} detected via detectors &nbsp;·&nbsp; {mms_mts:,} MTS &nbsp;·&nbsp; ~${mms_cost:,.2f}/mo'
+                f'{gap_html}</span>'
+                f'</div>')
+        if mms_rows:
+            rows = ""
+            for metric, mts, sev, dets_info in mms_rows:
+                det_html = _pills([d["name"] for d in dets_info], "#3b82f6", 5)
+                mts_cell  = f'{mts:,}' if mts is not None else '<span style="color:var(--muted);font-size:11px">Low</span>'
+                cost_cell = estimate_cost(mts) if mts is not None else '—'
+                sev_cell  = _sev_badge(sev) if sev else '<span style="color:var(--muted);font-size:11px">Low</span>'
+                rows += (
+                    f'<tr>'
+                    f'<td><code class="metric-name">{_h(metric)}</code></td>'
+                    f'<td style="text-align:right" data-val="{mts or 0}">{mts_cell}</td>'
+                    f'<td>{cost_cell}</td>'
+                    f'<td>{sev_cell}</td>'
+                    f'<td>{det_html or "<span style=\'color:var(--subtle);font-size:11px\'>—</span>"}</td>'
+                    f'</tr>'
+                )
+            out += (f'<div style="overflow-x:auto;margin-bottom:20px">'
+                    f'<table><thead><tr>'
+                    f'<th data-sort>Metric</th>'
+                    f'<th data-sort style="text-align:right">MTS</th>'
+                    f'<th data-sort>Est. Cost/Mo</th>'
+                    f'<th data-sort>Severity</th>'
+                    f'<th>Active Detectors</th>'
+                    f'</tr></thead><tbody>{rows}</tbody></table></div>')
+        else:
+            out += '<p style="color:var(--muted);font-size:12px;margin-bottom:20px">No metrics found in active detectors. Verify API token has detector read permissions.</p>'
+
+        out += breakdown_html
+
+        # ── MMS Reduction Opportunities ──
+        # A metric is freed from MMS when ALL detectors using it are deleted.
+        # Group by detector: show which detectors are the sole/exclusive user of metrics.
+        if dmap:
+            # For each detector, find metrics it exclusively owns (no other detector uses them)
+            # Build inverse: detector_id -> set of metrics it uses
+            det_to_metrics = defaultdict(list)
+            det_id_to_name = {}
+            for metric, dets_info in dmap.items():
+                for d in dets_info:
+                    det_to_metrics[d["id"]].append(metric)
+                    det_id_to_name[d["id"]] = d["name"]
+
+            # For each metric, count how many detectors reference it
+            metric_det_count = {m: len(ds) for m, ds in dmap.items()}
+
+            # Per detector: metrics that would leave MMS if this detector were deleted
+            # (i.e. metric_det_count[m] == 1, meaning this detector is the only one)
+            reduction_rows = []
+            for det_id, det_metrics in det_to_metrics.items():
+                exclusive = [m for m in det_metrics if metric_det_count[m] == 1]
+                if exclusive:
+                    reduction_rows.append((det_id_to_name[det_id], det_id, exclusive))
+            reduction_rows.sort(key=lambda x: -len(x[2]))
+
+            if reduction_rows:
+                total_reducible = sum(len(r[2]) for r in reduction_rows)
+                out += (f'<div style="margin:20px 0 6px">'
+                        f'<span style="font-size:12px;font-weight:700;color:#f97316">MMS Reduction Opportunities</span>'
+                        f'<span style="font-size:11px;color:var(--muted);margin-left:10px">'
+                        f'Deleting these detectors would remove {total_reducible} metric(s) from MMS</span>'
+                        f'</div>')
+                rows = ""
+                for det_name, det_id, exclusive_metrics in reduction_rows:
+                    metric_pills = "".join(
+                        f'<code style="font-size:11px;background:var(--hover);border:1px solid var(--border);'
+                        f'border-radius:4px;padding:1px 6px;margin:1px 2px;display:inline-block">{_h(m)}</code>'
+                        for m in sorted(exclusive_metrics)
+                    )
+                    rows += (
+                        f'<tr>'
+                        f'<td style="font-size:12px">{_h(det_name)}</td>'
+                        f'<td style="text-align:center;font-weight:700;color:#f97316" data-val="{len(exclusive_metrics)}">'
+                        f'−{len(exclusive_metrics)}</td>'
+                        f'<td style="max-width:400px">{metric_pills}</td>'
+                        f'</tr>'
+                    )
+                out += (f'<div style="overflow-x:auto;margin-bottom:20px">'
+                        f'<table><thead><tr>'
+                        f'<th data-sort>Detector</th>'
+                        f'<th data-sort style="text-align:center">MMS Freed</th>'
+                        f'<th>Metrics Released</th>'
+                        f'</tr></thead><tbody>{rows}</tbody></table></div>')
+
+        # ── Troubleshooting MetricSets ──
+        all_tms  = sorted(tms_findings + extra_tms, key=lambda x: -x[0]["mts_count"])
+        tms_mts  = sum(f["mts_count"] for f, _ in all_tms)
+        tms_cost = tms_mts * MTS_COST_PER_MONTH
+        out += (f'<div style="margin-bottom:6px">'
+                f'<span style="font-size:12px;font-weight:700;color:#8b5cf6">Troubleshooting MetricSets (TMS)</span>'
+                f'<span style="font-size:11px;color:var(--muted);margin-left:10px">'
+                f'{len(all_tms)} APM-generated metrics &nbsp;·&nbsp; {tms_mts:,} MTS &nbsp;·&nbsp; ~${tms_cost:,.2f}/mo</span>'
+                f'</div>')
+        if all_tms:
+            rows = ""
+            for f, detail in all_tms:
+                svcs = detail.get("services", [])
+                envs = detail.get("environments", [])
+                svc_html = _service_pills(svcs, 4) if svcs else '<span style="color:var(--subtle);font-size:11px">—</span>'
+                env_html = _env_pills(envs, 3) if envs else '<span style="color:var(--subtle);font-size:11px">—</span>'
+                rows += (
+                    f'<tr>'
+                    f'<td><code class="metric-name">{_h(f["metric"])}</code></td>'
+                    f'<td style="text-align:right" data-val="{f["mts_count"]}">{f["mts_count"]:,}</td>'
+                    f'<td>{estimate_cost(f["mts_count"])}</td>'
+                    f'<td>{_sev_badge(f["severity"])}</td>'
+                    f'<td>{svc_html}</td>'
+                    f'<td>{env_html}</td>'
+                    f'</tr>'
+                )
+            out += (f'<div style="overflow-x:auto">'
+                    f'<table><thead><tr>'
+                    f'<th data-sort>Metric</th>'
+                    f'<th data-sort style="text-align:right">MTS</th>'
+                    f'<th data-sort>Est. Cost/Mo</th>'
+                    f'<th data-sort>Severity</th>'
+                    f'<th>Generating Services</th>'
+                    f'<th>Environments</th>'
+                    f'</tr></thead><tbody>{rows}</tbody></table></div>')
+        else:
+            out += '<p style="color:var(--muted);font-size:12px">No APM-generated metrics found.</p>'
+
+        return out
+
     gen_time   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     limit_line = f" &middot; Org limit: {mts_limit:,} ({pct_used}% used)" if mts_limit else ""
 
     # Build section cards
+    def _env_overview_html():
+        env_stats = _scan_env_stats
+        if not env_stats:
+            return '<p style="color:var(--muted);font-size:12px">No environment data — run a fresh scan to populate.</p>'
+        # Build findings index for flagging environments with issues
+        env_findings = defaultdict(int)
+        for f in findings:
+            attr = f.get("attribution", {})
+            for env in attr.get("environments", []):
+                env_findings[env] += 1
+        total_org_mts = sum(v["mts"] for v in env_stats.values())
+        h = '<table><thead><tr>'
+        h += '<th data-sort>Environment</th>'
+        h += '<th data-sort style="text-align:right">Total MTS</th>'
+        h += '<th data-sort style="text-align:right">Metrics</th>'
+        h += '<th data-sort>% of Scanned</th>'
+        h += '<th>Issues</th>'
+        h += '</tr></thead><tbody>'
+        for env, stats in env_stats.items():
+            pct      = round(stats["mts"] / max(1, total_org_mts) * 100, 1)
+            bar      = f'<div style="height:6px;background:#3b82f6;width:{min(pct*2,100)}%;border-radius:3px;margin-top:4px"></div>'
+            n_issues = env_findings.get(env, 0)
+            issue_cell = (f'<span style="background:#ef444422;color:#ef4444;border-radius:4px;'
+                          f'padding:1px 7px;font-size:11px">{n_issues} finding{"s" if n_issues!=1 else ""}</span>'
+                          if n_issues else '<span style="color:var(--muted);font-size:11px">—</span>')
+            h += (f'<tr>'
+                  f'<td><code style="font-size:12px">{_h(env)}</code></td>'
+                  f'<td style="text-align:right" data-val="{stats["mts"]}">{stats["mts"]:,}</td>'
+                  f'<td style="text-align:right">{stats["metrics"]}</td>'
+                  f'<td data-val="{pct}">{pct}%{bar}</td>'
+                  f'<td>{issue_cell}</td>'
+                  f'</tr>')
+        h += '</tbody></table>'
+        return h
+
+    # APM Operations card — uses last saved snapshot from DB (no live fetch)
+    def _apm_ops_card():
+        rows = db_get_ops_history(limit=1)
+        if not rows:
+            return _card(
+                "APM Operations (MMS)",
+                '<p style="color:var(--muted);font-size:13px">No APM operations scan data yet. '
+                'Run <code>python3 cardinality_governance.py apm-ops-scan</code> to populate.</p>',
+                anchor="sec-apm-ops", open_by_default=False)
+        row = rows[0]
+        scanned_at, total_ops, attack_count, excl_count, consol_saveable, nonprod_count, prod_count = row
+        prod_pct    = round(prod_count    / max(total_ops, 1) * 100, 1)
+        nonprod_pct = round(nonprod_count / max(total_ops, 1) * 100, 1)
+        reduction   = round((attack_count + excl_count + consol_saveable) / max(total_ops, 1) * 100, 1)
+        body = f"""
+<p style="font-size:12px;color:var(--muted);margin-bottom:14px">
+  Last scanned: <strong>{_h(scanned_at[:16])}</strong> UTC &nbsp;·&nbsp;
+  Refresh with <code>apm-ops-scan</code>&nbsp;·&nbsp;
+  Export Word doc with <code>apm-ops-scan --format docx</code>
+</p>
+<div class="stat-grid" style="margin-bottom:16px">
+  <div class="stat"><div class="val">{total_ops:,}</div><div class="lbl">Total APM Ops (MMS)</div></div>
+  <div class="stat"><div class="val" style="color:#22c55e">{consol_saveable:,}</div><div class="lbl">MTS Saveable (parameterization)</div></div>
+  <div class="stat"><div class="val" style="color:#ef4444">{attack_count:,}</div><div class="lbl">Attack Payloads Detected</div></div>
+  <div class="stat"><div class="val" style="color:#eab308">{excl_count:,}</div><div class="lbl">Exclusion Candidates</div></div>
+  <div class="stat"><div class="val" style="color:#f97316">{nonprod_pct}%</div><div class="lbl">Non-prod MTS ({nonprod_count:,})</div></div>
+  <div class="stat"><div class="val">{reduction}%</div><div class="lbl">Est. Reduction Potential</div></div>
+</div>
+<table>
+  <thead><tr>
+    <th>Metric</th><th style="text-align:right">Count</th><th style="text-align:right">%</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>Production operations</td><td style="text-align:right">{prod_count:,}</td>
+        <td style="text-align:right" style="color:#22c55e">{prod_pct}%</td></tr>
+    <tr><td>Non-production operations</td><td style="text-align:right">{nonprod_count:,}</td>
+        <td style="text-align:right;color:#f97316">{nonprod_pct}%</td></tr>
+    <tr><td>Attack/probe payloads</td><td style="text-align:right;color:#ef4444">{attack_count:,}</td>
+        <td style="text-align:right"></td></tr>
+    <tr><td>Exclusion candidates (health checks, static assets, swagger, JVM)</td>
+        <td style="text-align:right;color:#eab308">{excl_count:,}</td>
+        <td style="text-align:right"></td></tr>
+    <tr><td>MTS saveable via parameterization</td>
+        <td style="text-align:right;color:#22c55e">{consol_saveable:,}</td>
+        <td style="text-align:right"></td></tr>
+  </tbody>
+</table>
+"""
+        return _card("APM Operations (MMS)", body, anchor="sec-apm-ops",
+                     border_color="#ef4444" if attack_count > 0 else "#3b82f6",
+                     open_by_default=True)
+
     overview_body       = _stat_grid()
     offenders_body      = offenders_table(findings, limit=50)
     scorecard_body      = scorecard_table()
+    env_overview_body   = _env_overview_html()
     _groups_result      = groups_html()
     groups_body         = _groups_result or '<p style="color:var(--muted)">No duplicate groups found.</p>'
     source_body         = _source_breakdown_html()
+    metricset_body      = _metricset_breakdown_html()
     resolved_body       = resolved_table()
     detailed_body       = (f'<p style="margin-bottom:12px;color:var(--muted);font-size:12px">Click a metric to expand dimension analysis and AI remediation.</p>'
                            + detailed_html())
@@ -2134,12 +3334,18 @@ def generate_html_report(findings, use_claude=True):
 
       {_card("Overview", overview_body, anchor="sec-overview")}
 
+      {_card("Environment Overview", env_overview_body, anchor="sec-envs", open_by_default=True)}
+
       {_card("Top Offenders", offenders_body, anchor="sec-offenders",
              border_color="#ef4444" if critical else "#f97316")}
 
       {_card("Per-Service Scorecard", scorecard_body, anchor="sec-scorecard")}
 
       {_card("Instrumentation Source Breakdown", source_body, anchor="sec-sources", open_by_default=True)}
+
+      {_card("MetricSet Breakdown",
+             '<p style="font-size:12px;color:var(--muted);margin-bottom:14px">MMS = metrics actively used in detectors. TMS = APM-generated high-cardinality metrics. Where each is used and which services generate it.</p>' + metricset_body,
+             anchor="sec-metricsets", open_by_default=True)}
 
       {_card("Duplicate / Similar Groups",
              '<p style="font-size:12px;color:var(--muted);margin-bottom:14px">Metrics sharing the same high-cardinality dimension or name prefix — one OTel Collector fix resolves the whole group.</p>' + groups_body,
@@ -3360,6 +4566,579 @@ def cmd_anomaly_scan(top_n=20, ratio=None, days=7, min_samples=None):
 # CLI
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# APM Operations Scan — docx export
+# ---------------------------------------------------------------------------
+
+def _generate_apm_ops_docx(result, environment, top_n):
+    """
+    Export apm-ops-scan results as a Word document.
+    Requires python-docx (pip install python-docx).
+    Returns the output Path or None on failure.
+    """
+    try:
+        from docx import Document
+        from docx.shared import Pt, RGBColor, Inches
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+    except ImportError:
+        print("  python-docx not installed. Run: pip install python-docx")
+        return None
+
+    # ── Color constants ───────────────────────────────────────────────────────
+    SPLUNK_GREEN = RGBColor(0x65, 0xA6, 0x37)
+    RED_CRIT     = RGBColor(0xEF, 0x44, 0x44)
+    AMBER        = RGBColor(0xF9, 0x73, 0x16)
+    BLUE_INFO    = RGBColor(0x3B, 0x82, 0xF6)
+    GRAY         = RGBColor(0x64, 0x74, 0x8B)
+    WHITE        = RGBColor(0xFF, 0xFF, 0xFF)
+    DARK         = RGBColor(0x1E, 0x29, 0x3B)
+
+    doc = Document()
+
+    for section in doc.sections:
+        section.left_margin   = Inches(0.85)
+        section.right_margin  = Inches(0.85)
+        section.top_margin    = Inches(0.75)
+        section.bottom_margin = Inches(0.75)
+
+    def _shade_cell(cell, r, g, b):
+        tc   = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        shd  = OxmlElement('w:shd')
+        shd.set(qn('w:val'), 'clear')
+        shd.set(qn('w:color'), 'auto')
+        shd.set(qn('w:fill'), f'{r:02X}{g:02X}{b:02X}')
+        tcPr.append(shd)
+
+    def _cell(cell, text, bold=False, color=None, size=10, align=None):
+        cell.text = ""
+        p = cell.paragraphs[0]
+        if align:
+            p.alignment = align
+        run = p.add_run(str(text))
+        run.font.size = Pt(size)
+        run.font.bold = bold
+        if color:
+            run.font.color.rgb = color
+
+    # ── Title ─────────────────────────────────────────────────────────────────
+    title_p = doc.add_paragraph()
+    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    tr = title_p.add_run("APM Monitoring MetricSet (MMS) Operations Analysis")
+    tr.font.size = Pt(18)
+    tr.font.bold = True
+    tr.font.color.rgb = DARK
+
+    sub_p = doc.add_paragraph()
+    sub_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    ts_str  = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    env_str = f"Environment: {environment}" if environment else "All Environments"
+    sr = sub_p.add_run(f"Splunk Observability Cloud  ·  Realm: {REALM}  ·  {env_str}  ·  {ts_str}")
+    sr.font.size = Pt(11)
+    sr.font.color.rgb = GRAY
+    doc.add_paragraph()
+
+    # ── Executive Summary ─────────────────────────────────────────────────────
+    total       = result["total"]
+    attacks     = len(result["attacks"])
+    excl        = result["total_excl"]
+    saveable    = result["total_mts_saveable"]
+    nonprod_pct = round(result["nonprod_count"] / max(total, 1) * 100, 1)
+    reduction   = result["reduction_pct"]
+
+    h1 = doc.add_heading("Executive Summary", level=1)
+    h1.runs[0].font.color.rgb = DARK
+
+    tbl = doc.add_table(rows=2, cols=5)
+    tbl.style = "Table Grid"
+    hdrs   = ["Total APM Ops (MMS)", "Attack Payloads", "Exclusion Candidates",
+              "MTS Saveable", "Non-prod MTS"]
+    vals   = [f"{total:,}", f"{attacks:,}", f"{excl:,}", f"{saveable:,}", f"{nonprod_pct}%"]
+    colors = [(0x3B,0x82,0xF6), (0xEF,0x44,0x44), (0xEA,0xB3,0x08),
+              (0x22,0xC5,0x5E), (0xF9,0x73,0x16)]
+    for i, (hdr, val, col) in enumerate(zip(hdrs, vals, colors)):
+        hc = tbl.rows[0].cells[i]
+        vc = tbl.rows[1].cells[i]
+        _shade_cell(hc, *col)
+        _cell(hc, hdr, bold=True, color=WHITE, size=10, align=WD_ALIGN_PARAGRAPH.CENTER)
+        _cell(vc, val, bold=True, color=RGBColor(*col), size=22, align=WD_ALIGN_PARAGRAPH.CENTER)
+    doc.add_paragraph()
+
+    # ── Key Findings ──────────────────────────────────────────────────────────
+    h1 = doc.add_heading("Key Findings", level=1)
+    h1.runs[0].font.color.rgb = DARK
+    findings_rows = [
+        ("Non-prod MTS dominance",
+         f"{result['nonprod_count']:,} ops ({nonprod_pct}%) from non-prod environments",
+         "CRITICAL", "Suppress MetricSet generation for non-prod in OTel Collector"),
+        ("High-cardinality operations",
+         f"{saveable:,} MTS saveable by normalising {len(result['consolidation'])} patterns",
+         "HIGH", "Set http.route (parameterised) instead of http.target in APM spans"),
+        ("Security probe payloads",
+         f"{attacks:,} operation names contain attack signatures (SQLi, SSTI, Burp Collaborator)",
+         "HIGH" if attacks else "INFO", "WAF review + OTel Collector filter/exclude processor"),
+        ("Exclusion candidates",
+         f"{excl:,} ops are health checks, static assets, swagger, or JVM classnames",
+         "MEDIUM", "OTel Collector filter/exclude processor"),
+    ]
+    ftbl = doc.add_table(rows=1 + len(findings_rows), cols=4)
+    ftbl.style = "Table Grid"
+    for i, hdr in enumerate(["Finding", "Detail", "Priority", "Remediation"]):
+        c = ftbl.rows[0].cells[i]
+        _shade_cell(c, 0x1E, 0x29, 0x3B)
+        _cell(c, hdr, bold=True, color=WHITE, size=10)
+    prio_color = {"CRITICAL": RED_CRIT, "HIGH": AMBER, "MEDIUM": RGBColor(0xEA,0xB3,0x08),
+                  "INFO": BLUE_INFO}
+    for ri, (finding, detail, prio, rem) in enumerate(findings_rows, 1):
+        row = ftbl.rows[ri]
+        _cell(row.cells[0], finding, bold=True, size=9)
+        _cell(row.cells[1], detail, size=9)
+        _cell(row.cells[2], prio, bold=True, color=prio_color.get(prio, GRAY), size=9)
+        _cell(row.cells[3], rem, size=9)
+    doc.add_paragraph()
+
+    # ── Top Parameterization Patterns ─────────────────────────────────────────
+    h1 = doc.add_heading(f"Top {min(top_n, len(result['consolidation']))} Parameterization Patterns", level=1)
+    h1.runs[0].font.color.rgb = DARK
+
+    cp = doc.add_paragraph()
+    cr = cp.add_run(
+        f"Normalising dynamic path segments (e.g. /case/12345 → /case/{{ID}}) collapses "
+        f"multiple MTS into one without losing observability. "
+        f"Total saveable: {saveable:,} MTS."
+    )
+    cr.font.size = Pt(10)
+    cr.font.italic = True
+
+    top_consol = result["consolidation"][:top_n]
+    if top_consol:
+        has_uniq = "unique_values" in top_consol[0]
+        ncols = 6 if has_uniq else 5
+        ptbl = doc.add_table(rows=1 + len(top_consol), cols=ncols)
+        ptbl.style = "Table Grid"
+        phdrs = ["#", "Pattern", "Ops", "Uniq Values", "MTS Saved", "Sample Values"]
+        if not has_uniq:
+            phdrs = ["#", "Pattern", "Ops", "MTS Saved", "Services"]
+        for i, hdr in enumerate(phdrs):
+            c = ptbl.rows[0].cells[i]
+            _shade_cell(c, 0x1E, 0x29, 0x3B)
+            _cell(c, hdr, bold=True, color=WHITE, size=10)
+        for ri, entry in enumerate(top_consol, 1):
+            row = ptbl.rows[ri]
+            if has_uniq:
+                sample_vals = ", ".join(str(v) for v in entry.get("unique_val_samples", [])[:5])
+                vals = [str(ri), entry["pattern"], f"{entry['count']:,}",
+                        str(entry.get("unique_values", "—")),
+                        f"{entry['mts_saved']:,}", sample_vals]
+            else:
+                svcs = ", ".join(entry["services"][:3])
+                vals = [str(ri), entry["pattern"], f"{entry['count']:,}",
+                        f"{entry['mts_saved']:,}", svcs]
+            for ci, v in enumerate(vals):
+                _cell(row.cells[ci], v, size=9)
+    doc.add_paragraph()
+
+    # ── Security Probe Detections ─────────────────────────────────────────────
+    if result["attacks"]:
+        h1 = doc.add_heading("Security Probe Detections", level=1)
+        h1.runs[0].font.color.rgb = RED_CRIT
+
+        wp = doc.add_paragraph()
+        wr = wp.add_run(
+            f"WARNING: {attacks:,} APM operation name(s) contain known attack signatures. "
+            "Each unique payload creates a new MTS and signals active probe/pentest activity. "
+            "Recommend WAF review and OTel Collector filter."
+        )
+        wr.font.size = Pt(10)
+        wr.font.bold = True
+        wr.font.color.rgb = RED_CRIT
+
+        by_type = result["attack_by_type"]
+        atbl = doc.add_table(rows=1 + len(by_type), cols=3)
+        atbl.style = "Table Grid"
+        for i, hdr in enumerate(["Attack Type", "Count", "Sample Services"]):
+            c = atbl.rows[0].cells[i]
+            _shade_cell(c, 0xEF, 0x44, 0x44)
+            _cell(c, hdr, bold=True, color=WHITE, size=10)
+        for ri, (atype, alist) in enumerate(
+                sorted(by_type.items(), key=lambda x: -len(x[1])), 1):
+            svcs = ", ".join(sorted({a["service"] for a in alist if a["service"]})[:3]) or "—"
+            row  = atbl.rows[ri]
+            _cell(row.cells[0], atype, size=9)
+            _cell(row.cells[1], str(len(alist)), size=9)
+            _cell(row.cells[2], svcs, size=9)
+        doc.add_paragraph()
+
+    # ── Environment Distribution ───────────────────────────────────────────────
+    h1 = doc.add_heading("Environment Distribution", level=1)
+    h1.runs[0].font.color.rgb = DARK
+
+    env_items = sorted(result["env_distribution"].items(), key=lambda x: -x[1])[:20]
+    etbl = doc.add_table(rows=1 + len(env_items), cols=3)
+    etbl.style = "Table Grid"
+    for i, hdr in enumerate(["Environment", "Operations", "% of Total"]):
+        c = etbl.rows[0].cells[i]
+        _shade_cell(c, 0x1E, 0x29, 0x3B)
+        _cell(c, hdr, bold=True, color=WHITE, size=10)
+    for ri, (env, cnt) in enumerate(env_items, 1):
+        pct     = round(cnt / max(total, 1) * 100, 1)
+        row     = etbl.rows[ri]
+        is_prod = env.startswith("prod-")
+        _cell(row.cells[0], env, size=9, color=SPLUNK_GREEN if is_prod else None)
+        _cell(row.cells[1], f"{cnt:,}", size=9)
+        _cell(row.cells[2], f"{pct}%", size=9)
+    doc.add_paragraph()
+
+    # ── Exclusion Candidates ──────────────────────────────────────────────────
+    excl_data  = result["exclusions"]
+    if result["total_excl"]:
+        h1 = doc.add_heading("Exclusion Candidates", level=1)
+        h1.runs[0].font.color.rgb = DARK
+
+        excl_labels = {
+            "health_check":  "Health check endpoints (/health, /actuator/health)",
+            "static_asset":  "Static assets (JS chunks, fonts, tfe-eks-p2x hashes)",
+            "swagger_docs":  "Swagger / API-doc endpoints",
+            "jvm_classname": "JVM classname spans (Spring WebFlux lambda addresses)",
+            "bare_method":   "Bare HTTP method (broken instrumentation — no route captured)",
+        }
+        active = [(cls, lbl) for cls, lbl in excl_labels.items() if excl_data.get(cls)]
+        xtbl = doc.add_table(rows=1 + len(active), cols=3)
+        xtbl.style = "Table Grid"
+        for i, hdr in enumerate(["Category", "Count", "Sample Operation"]):
+            c = xtbl.rows[0].cells[i]
+            _shade_cell(c, 0xEA, 0xB3, 0x08)
+            _cell(c, hdr, bold=True, color=WHITE, size=10)
+        for ri, (cls, lbl) in enumerate(active, 1):
+            members = excl_data[cls]
+            sample  = members[0]["operation"][:70] if members else "—"
+            row     = xtbl.rows[ri]
+            _cell(row.cells[0], lbl, size=9)
+            _cell(row.cells[1], str(len(members)), size=9)
+            _cell(row.cells[2], sample, size=9)
+        doc.add_paragraph()
+
+    # ── Remediation Priority Table ────────────────────────────────────────────
+    h1 = doc.add_heading("Remediation Priority", level=1)
+    h1.runs[0].font.color.rgb = DARK
+
+    recs = [
+        ("1", "CRITICAL", "Suppress non-prod MetricSet generation",
+         f"~{result['nonprod_count']:,}", "Low", "Ops/Platform",
+         "OTel Collector filter — deployment.environment regexp"),
+        ("2", "HIGH", "Fix HTTP route parameterisation (http.route vs http.target)",
+         f"~{saveable:,}", "Low–Med", "Dev teams",
+         "OTel auto-instrumentation or custom SpanProcessor"),
+        ("3", "HIGH", "Block / filter attack probe payloads in APM",
+         f"~{attacks:,}", "Medium", "Security / Platform",
+         "WAF rules + OTel Collector filter/exclude"),
+        ("4", "MEDIUM", "Exclude health checks and static assets",
+         f"~{excl:,}", "Low", "Platform",
+         "OTel Collector filter/exclude processor"),
+    ]
+    rtbl = doc.add_table(rows=1 + len(recs), cols=7)
+    rtbl.style = "Table Grid"
+    for i, hdr in enumerate(["#", "Priority", "Action", "Est. MTS Saved",
+                              "Effort", "Owner", "Mechanism"]):
+        c = rtbl.rows[0].cells[i]
+        _shade_cell(c, 0x1E, 0x29, 0x3B)
+        _cell(c, hdr, bold=True, color=WHITE, size=9)
+    prio_map = {"CRITICAL": (RED_CRIT, (0xFE,0xF2,0xF2)),
+                "HIGH":     (AMBER,    (0xFF,0xF7,0xED)),
+                "MEDIUM":   (RGBColor(0xEA,0xB3,0x08), (0xFF,0xFB,0xEB))}
+    for ri, rec in enumerate(recs, 1):
+        num, prio, action, mts, effort, owner, mech = rec
+        row  = rtbl.rows[ri]
+        pcol, pbg = prio_map.get(prio, (GRAY, (0xF8,0xFA,0xFC)))
+        _shade_cell(row.cells[1], *pbg)
+        _cell(row.cells[0], num, size=9, align=WD_ALIGN_PARAGRAPH.CENTER)
+        _cell(row.cells[1], prio, bold=True, color=pcol, size=9)
+        _cell(row.cells[2], action, size=9)
+        _cell(row.cells[3], mts, size=9)
+        _cell(row.cells[4], effort, size=9)
+        _cell(row.cells[5], owner, size=9)
+        _cell(row.cells[6], mech, size=9)
+    doc.add_paragraph()
+
+    # ── OTel Collector Reference Config ───────────────────────────────────────
+    h1 = doc.add_heading("OTel Collector Reference Configuration", level=1)
+    h1.runs[0].font.color.rgb = DARK
+
+    cp2 = doc.add_paragraph()
+    cr2 = cp2.add_run("Add the following processors to your OTel Collector pipeline:")
+    cr2.font.size = Pt(10)
+
+    otel_conf = (
+        "filter/drop_apm_noise:\n"
+        "  spans:\n"
+        "    exclude:\n"
+        "      match_type: regexp\n"
+        "      attributes:\n"
+        "        - key: http.target\n"
+        '          value: "^/(health|healthcheck|actuator/(health|info))'
+        r'|\.(js|css|woff2?)$|swagger|api-docs|tfe-eks-p2x"'
+        "\n\n"
+        "filter/drop_nonprod_mms:\n"
+        "  spans:\n"
+        "    exclude:\n"
+        "      match_type: regexp\n"
+        "      resource_attributes:\n"
+        "        - key: deployment.environment\n"
+        '          value: "^(devl|acpt|test|cont|dev|qa|staging)-"'
+    )
+    cp3 = doc.add_paragraph()
+    cr3 = cp3.add_run(otel_conf)
+    cr3.font.name = "Courier New"
+    cr3.font.size = Pt(9)
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    REPORTS_DIR.mkdir(exist_ok=True)
+    ts      = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    outpath = REPORTS_DIR / f"apm_ops_report_{ts}.docx"
+    doc.save(str(outpath))
+    return outpath
+
+
+# ---------------------------------------------------------------------------
+# APM Operations Scan command
+# ---------------------------------------------------------------------------
+
+def cmd_apm_ops_scan(environment=None, top_n=30, no_save=False, show_attacks=True,
+                     show_exclusions=True, show_env=True, fmt="text"):
+    """
+    Fetch all APM Monitoring MetricSet operations directly from the
+    /v2/metrictimeseries API — no raw data export required.
+
+    Runs four analysis passes:
+      1. Parameterization  — groups high-cardinality operation names by pattern
+      2. Security probes   — detects attack payloads in operation names
+      3. Env distribution  — prod vs non-prod MTS split
+      4. Exclusion candidates — health checks, static assets, swagger, JVM classnames
+    """
+    env_tag = f"  env={environment}" if environment else "  all environments"
+    print(f"\nAPM Operations Scan  (realm={REALM}){env_tag}\n")
+    print("  Fetching APM MTS from /v2/metrictimeseries (paginated)...")
+
+    ops = fetch_apm_operations(environment=environment, dedup=True)
+    if not ops:
+        print("  No APM operations found. Check token permissions and environment name.")
+        return
+
+    total_raw = sum(o.get("mts_count", 1) for o in ops)
+    print(f"  {len(ops):,} unique operations ({total_raw:,} total MTS rows).  Running analysis...\n")
+
+    result = analyze_apm_operations(ops)
+
+    # ── Environment distribution ───────────────────────────────────────────────
+    if show_env:
+        prod    = result["prod_count"]
+        nonprod = result["nonprod_count"]
+        total_  = prod + nonprod
+        print("=" * 90)
+        print("  ENVIRONMENT DISTRIBUTION")
+        print("=" * 90)
+        print(f"  {'Tier':<35} {'MTS':>12}  {'% of Total':>10}")
+        print("  " + "─" * 62)
+        env_items = sorted(result["env_distribution"].items(), key=lambda x: -x[1])
+        for env, cnt in env_items[:20]:
+            bar_pct = round(cnt / max(total_, 1) * 100, 1)
+            tier    = "prod" if env.startswith("prod-") else "non-prod"
+            marker  = " ◀ prod" if tier == "prod" else ""
+            print(f"  {env:<35} {cnt:>12,}  {bar_pct:>9.1f}%{marker}")
+        if len(env_items) > 20:
+            print(f"  ... and {len(env_items) - 20} more environments")
+        print()
+        prod_pct    = round(prod    / max(total_, 1) * 100, 1)
+        nonprod_pct = round(nonprod / max(total_, 1) * 100, 1)
+        print(f"  Production total:      {prod:>8,}  ({prod_pct}%)")
+        print(f"  Non-production total:  {nonprod:>8,}  ({nonprod_pct}%)")
+        if nonprod_pct > 50:
+            print(f"\n  [HIGH IMPACT]  {nonprod_pct}% of MMS operations come from non-prod.")
+            print("  Suppressing MetricSet generation for non-prod environments in the OTel")
+            print("  Collector is the single highest-leverage remediation available.")
+        print()
+
+    # ── Security / attack probes ──────────────────────────────────────────────
+    if show_attacks and result["attacks"]:
+        attacks      = result["attacks"]
+        by_type      = result["attack_by_type"]
+        print("=" * 90)
+        print(f"  SECURITY PROBE DETECTION  —  {len(attacks)} attack payloads found in operation names")
+        print("=" * 90)
+        print("  NOTE: These are WAF bypass attempts / pentest payloads captured as APM span")
+        print("  operation names. Each unique payload creates a new MTS. Recommend:")
+        print("    1. Security team review (oastify.com = active Burp Suite Collaborator)")
+        print("    2. WAF rules to block before instrumentation layer")
+        print("    3. OTel Collector filter to drop spans with attack signatures\n")
+        print(f"  {'Attack Type':<35} {'Count':>7}  {'Services'}")
+        print("  " + "─" * 80)
+        for atype, alist in sorted(by_type.items(), key=lambda x: -len(x[1])):
+            svcs = ", ".join(sorted({a["service"] for a in alist if a["service"]})[:3])
+            print(f"  {atype:<35} {len(alist):>7,}  {svcs or '—'}")
+        print(f"\n  Sample payloads:")
+        shown = set()
+        for a in attacks[:6]:
+            snippet = a["operation"][:110]
+            if snippet not in shown:
+                print(f"    [{a['attack_type']}]  {snippet}")
+                shown.add(snippet)
+        print()
+
+    # ── Parameterization / consolidation ─────────────────────────────────────
+    consolidation = result["consolidation"][:top_n]
+    total_saveable = result["total_mts_saveable"]
+    print("=" * 90)
+    print(f"  PARAMETERIZATION OPPORTUNITIES  —  top {len(consolidation)} patterns")
+    print(f"  Total MTS saveable via parameterization: {total_saveable:,}")
+    print("=" * 90)
+    if consolidation:
+        print(f"\n  {'Rank':<5} {'Pattern':<55} {'MTS':>7} {'Uniq':>6} {'Saved':>7}  {'Services (sample)'}")
+        print("  " + "─" * 110)
+        for i, c in enumerate(consolidation, 1):
+            svcs = ", ".join(c["services"][:2])
+            if len(c["services"]) > 2:
+                svcs += f"  +{len(c['services'])-2}"
+            uniq = c.get("unique_values", c.get("unique_ops", len(c["samples"])))
+            print(f"  {i:<5} {c['pattern']:<55} {c['count']:>7,} {uniq:>6,} {c['mts_saved']:>7,}  {svcs}")
+            for s in c["samples"][:2]:
+                print(f"        {'':55} e.g. {s[:60]}")
+        print()
+        print("  Fix: ensure your OTel instrumentation sets http.route (parameterized route)")
+        print("  instead of http.target (resolved URL). Most web frameworks do this")
+        print("  automatically when using OTel auto-instrumentation.")
+    else:
+        print("  No parameterization opportunities found — operation names look well-formed.\n")
+
+    # ── Exclusion candidates ──────────────────────────────────────────────────
+    if show_exclusions:
+        excl        = result["exclusions"]
+        total_excl  = result["total_excl"]
+        excl_labels = {
+            "health_check": "Health check endpoints  (/health, /actuator/health, etc.)",
+            "static_asset": "Static assets  (JS chunks, fonts, tfe-eks-p2x hashes)",
+            "swagger_docs": "Swagger / API-doc endpoints  (/swagger-ui, /api-docs)",
+            "jvm_classname": "JVM classname spans  (Spring WebFlux error handler lambda addresses)",
+            "bare_method":  "Bare HTTP method  (no route captured — broken instrumentation)",
+        }
+        if total_excl:
+            print("=" * 90)
+            print(f"  EXCLUSION CANDIDATES  —  {total_excl:,} MTS with no APM value")
+            print("  These should be filtered in the OTel Collector or excluded from MetricSet generation.")
+            print("=" * 90)
+            print(f"\n  {'Category':<60} {'MTS':>7}  {'Sample operation'}")
+            print("  " + "─" * 100)
+            for cls, label in excl_labels.items():
+                members = excl.get(cls, [])
+                if not members:
+                    continue
+                mts_total = sum(m.get("mts_count", 1) for m in members)
+                sample    = members[0]["operation"][:55] if members else ""
+                print(f"  {label:<60} {mts_total:>7,}  {sample}")
+            print()
+            print("  OTel Collector filter reference:")
+            print("    filter/drop_apm_noise:")
+            print("      spans:")
+            print("        exclude:")
+            print("          match_type: regexp")
+            print("          attributes:")
+            print("            - key: http.target")
+            print('              value: "^/(health|healthcheck|actuator/(health|info))'
+                  r'|\.(js|css|woff2?)$|swagger|api-docs|tfe-eks-p2x"')
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print()
+    print("=" * 90)
+    print("  SUMMARY")
+    print("=" * 90)
+    total       = result["total"]
+    prod_pct    = round(result["prod_count"]    / max(total, 1) * 100, 1)
+    nonprod_pct = round(result["nonprod_count"] / max(total, 1) * 100, 1)
+    unique_ops  = result.get("total_unique_ops", total)
+    print(f"  Total APM MTS (billing rows):      {total:>8,}  ← matches raw engineering export")
+    print(f"  Unique (op, service, env) triples: {unique_ops:>8,}  ← unique operation patterns")
+    print(f"  Production MTS:                    {result['prod_count']:>8,}  ({prod_pct}%)")
+    print(f"  Non-production MTS:                {result['nonprod_count']:>8,}  ({nonprod_pct}%)")
+    print(f"  Attack/probe MTS detected:         {len(result['attacks']):>8,}")
+    print(f"  Exclusion candidate MTS:           {result['total_excl']:>8,}")
+    print(f"  Parameterization MTS saveable:     {result['total_mts_saveable']:>8,}")
+    print(f"  Est. overall reduction potential:  {result['reduction_pct']:>7.1f}%")
+    print()
+
+    # ── Docx export ───────────────────────────────────────────────────────────
+    if fmt == "docx":
+        docx_path = _generate_apm_ops_docx(result, environment, top_n)
+        if docx_path:
+            print(f"  Word document: {docx_path}")
+
+    # ── Persist snapshot ─────────────────────────────────────────────────────
+    if not no_save:
+        db_save_ops_snapshot(result, environment=environment)
+        print(f"  Snapshot saved to {STATE_DB}  (use apm-ops-history to trend over time)")
+
+    print()
+
+
+def cmd_apm_ops_dump(environment=None, output=None):
+    """
+    Fetch all APM MTS rows without deduplication and write them as TSV —
+    identical in format to the raw engineering export (e.g. GAR3eKDAYAI.txt):
+
+        MTS_ID  "operation"  "service"  "environment"
+
+    Use --output to write to a file; omit to print to stdout.
+    """
+    import sys
+    env_tag = f"  env={environment}" if environment else "  all environments"
+    print(f"\nAPM Operations Dump  (realm={REALM}){env_tag}", file=sys.stderr)
+    print("  Fetching all MTS rows (no deduplication)...", file=sys.stderr)
+
+    ops = fetch_apm_operations(environment=environment, dedup=False)
+    if not ops:
+        print("  No APM operations found.", file=sys.stderr)
+        return
+
+    unique_triples = len({(o["operation"], o["service"], o["environment"]) for o in ops})
+    print(f"  {len(ops):,} total MTS rows  /  {unique_triples:,} unique (op, svc, env) triples",
+          file=sys.stderr)
+
+    fh = open(output, "w", encoding="utf-8") if output else sys.stdout
+    try:
+        for op in ops:
+            fh.write(f'{op["mts_id"]}\t"{op["operation"]}"\t"{op["service"]}"\t"{op["environment"]}"\n')
+    finally:
+        if output:
+            fh.close()
+
+    if output:
+        print(f"  Written to {output}", file=sys.stderr)
+    print(file=sys.stderr)
+
+
+def cmd_apm_ops_history(environment=None, limit=30):
+    """Show historical apm-ops-scan runs for trending."""
+    rows = db_get_ops_history(environment=environment, limit=limit)
+    env_tag = f"  env={environment}" if environment else "  all environments"
+    print(f"\nAPM Operations Scan History  (realm={REALM}){env_tag}\n")
+    if not rows:
+        print("  No history yet. Run 'apm-ops-scan' to start building history.")
+        return
+    print(f"  {'Date':<22} {'Ops':>8} {'Attacks':>8} {'Excl':>7} {'Consol Saved':>13} "
+          f"{'Non-Prod':>10} {'Prod':>8}")
+    print("  " + "─" * 82)
+    prev_total = None
+    for scanned_at, total_ops, attacks, excl, consol, nonprod, prod in rows:
+        delta = ""
+        if prev_total is not None and prev_total > 0:
+            chg = total_ops - prev_total
+            delta = f"  ({'+' if chg>=0 else ''}{chg:,})"
+        print(f"  {scanned_at[:19]:<22} {total_ops:>8,}{delta:<12} {attacks:>8,} {excl:>7,} "
+              f"{consol:>13,} {nonprod:>10,} {prod:>8,}")
+        prev_total = total_ops
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Metric Cardinality Governance for Splunk Observability Cloud")
     sub = parser.add_subparsers(dest="command")
@@ -3371,7 +5150,7 @@ def main():
 
     # report
     p_report = sub.add_parser("report", help="Generate full Markdown or HTML report with AI remediation")
-    p_report.add_argument("--top", type=int, default=50, help="Analyze top N metrics (default: 50)")
+    p_report.add_argument("--top", type=int, default=200, help="Analyze top N metrics (default: 200)")
     p_report.add_argument("--no-ai", action="store_true", help="Skip AI remediation (faster)")
     p_report.add_argument("--format", choices=["md", "html", "both"], default="md",
                           help="Output format: md (default), html, or both")
@@ -3389,6 +5168,14 @@ def main():
     p_resolve = sub.add_parser("resolve", help="Manually mark a metric as remediated")
     p_resolve.add_argument("--metric", required=True, help="Metric name to mark resolved")
     p_resolve.add_argument("--note", default="", help="Optional note (e.g. 'applied delete_key fix in collector v1.2')")
+
+    # metricsets
+    p_ms = sub.add_parser("metricsets", help=(
+        "Classify findings as MMS (Monitoring MetricSets — in active detectors) or "
+        "TMS (Troubleshooting MetricSets — APM-generated). Shows which detectors use "
+        "each MMS metric and which services/environments generate each TMS metric."
+    ))
+    p_ms.add_argument("--top", type=int, default=50, help="Analyze top N metrics (default: 50)")
 
     # drilldown
     p_drill = sub.add_parser("drilldown", help="Show all metrics carrying a given dimension — full blast radius before applying a fix")
@@ -3498,6 +5285,50 @@ def main():
     p_ascan.add_argument("--min-samples", type=int, default=ANOMALY_MIN_SAMPLES,
                          help=f"Minimum history points required (default: {ANOMALY_MIN_SAMPLES})")
 
+    # apm-ops-scan
+    p_aops = sub.add_parser("apm-ops-scan", help=(
+        "Scan all APM Monitoring MetricSet operations via API — no raw export needed. "
+        "Detects high-cardinality operation names, security/probe payloads, non-prod MTS "
+        "waste, and exclusion candidates (health checks, static assets, swagger). "
+        "Equivalent to manually analysing a raw MMS data dump from engineering."
+    ))
+    p_aops.add_argument("--environment", "-e", default=None,
+                        help="Filter to a specific APM environment (e.g. prod-sfbu). "
+                             "Omit to scan all environments.")
+    p_aops.add_argument("--top", type=int, default=30,
+                        help="Show top N parameterization patterns (default: 30)")
+    p_aops.add_argument("--no-save", action="store_true",
+                        help="Print only — do not persist snapshot to history")
+    p_aops.add_argument("--no-attacks", action="store_true",
+                        help="Skip the security probe detection section")
+    p_aops.add_argument("--no-exclusions", action="store_true",
+                        help="Skip the exclusion candidates section")
+    p_aops.add_argument("--no-env", action="store_true",
+                        help="Skip the environment distribution section")
+    p_aops.add_argument("--format", "-f", choices=["text", "docx"], default="text",
+                        help="Output format: text (default) or docx (Word document, requires python-docx)")
+
+    # apm-ops-dump
+    p_aopd = sub.add_parser("apm-ops-dump", help=(
+        "Dump all APM MTS rows as TSV — identical format to the raw engineering export "
+        "(one row per MTS_ID, no deduplication). Useful for validating API parity or "
+        "offline analysis."
+    ))
+    p_aopd.add_argument("--environment", "-e", default=None,
+                        help="Filter to a specific APM environment")
+    p_aopd.add_argument("--output", "-o", default=None,
+                        help="Write output to a file (default: stdout)")
+
+    # apm-ops-history
+    p_aoph = sub.add_parser("apm-ops-history", help=(
+        "Show trend history for apm-ops-scan runs — total operations, attack count, "
+        "exclusion candidates, and consolidation savings over time."
+    ))
+    p_aoph.add_argument("--environment", "-e", default=None,
+                        help="Filter history to a specific environment")
+    p_aoph.add_argument("--limit", type=int, default=30,
+                        help="Number of past scans to show (default: 30)")
+
     args = parser.parse_args()
 
     if not TOKEN:
@@ -3510,8 +5341,8 @@ def main():
             print("No cardinality issues found.")
             return
 
-        print(f"\n{'Rank':<5} {'Metric':<45} {'MTS':>8} {'Trend':<12} {'Severity':<12} {'Source':<28} {'Worst Dimension'}")
-        print("-" * 140)
+        print(f"\n{'Rank':<5} {'Metric':<45} {'MTS':>8} {'Trend':<12} {'Severity':<12} {'MS':<5} {'Source':<28} {'Worst Dimension'}")
+        print("-" * 148)
         for i, f in enumerate(findings, 1):
             sev_icon   = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}.get(f["severity"], "⚪")
             trend_icon = {"GROWING": "📈", "FALLING": "📉", "NEW": "🆕", "STABLE": "➡️"}.get(f.get("trend",""), "")
@@ -3519,8 +5350,9 @@ def main():
             if f.get("growth_pct") and f.get("trend") == "GROWING":
                 trend_str += f"(+{int(f['growth_pct']*100)}%)"
             anomaly_tag = f" [ANOMALY {f['baseline_ratio']}x]" if f.get("anomaly") else ""
-            worst = f"{f['worst_dim']} ({f['worst_dim_info']['unique_values']:,})" if f["worst_dim"] else "—"
-            print(f"{i:<5} {f['metric']:<45} {f['mts_count']:>8,} {trend_str:<14} {sev_icon+f['severity']:<14} {f['instr_source']:<28} {worst}{anomaly_tag}")
+            worst  = f"{f['worst_dim']} ({f['worst_dim_info']['unique_values']:,})" if f["worst_dim"] else "—"
+            ms_tag = {"MMS": "MMS", "TMS": "TMS"}.get(f.get("ms_type", ""), "")
+            print(f"{i:<5} {f['metric']:<45} {f['mts_count']:>8,} {trend_str:<14} {sev_icon+f['severity']:<14} {ms_tag:<5} {f['instr_source']:<28} {worst}{anomaly_tag}")
 
     elif args.command == "report":
         findings = scan_org(top_n=args.top)
@@ -3540,6 +5372,9 @@ def main():
                 subprocess.Popen(["open", str(html_path)])
             except Exception:
                 pass
+
+    elif args.command == "metricsets":
+        cmd_metricsets(top_n=args.top)
 
     elif args.command == "watch":
         watch_mode(interval=args.interval, threshold=args.threshold)
@@ -3638,6 +5473,29 @@ def main():
             ratio       = args.ratio,
             days        = args.days,
             min_samples = args.min_samples,
+        )
+
+    elif args.command == "apm-ops-scan":
+        cmd_apm_ops_scan(
+            environment      = args.environment,
+            top_n            = args.top,
+            no_save          = args.no_save,
+            show_attacks     = not args.no_attacks,
+            show_exclusions  = not args.no_exclusions,
+            show_env         = not args.no_env,
+            fmt              = args.format,
+        )
+
+    elif args.command == "apm-ops-dump":
+        cmd_apm_ops_dump(
+            environment = args.environment,
+            output      = args.output,
+        )
+
+    elif args.command == "apm-ops-history":
+        cmd_apm_ops_history(
+            environment = args.environment,
+            limit       = args.limit,
         )
 
     else:
