@@ -71,6 +71,13 @@ export AWS_SESSION_TOKEN=<token>     # if using temporary credentials
 | `trace-scan` | Snapshot current per-service span volumes and save to history |
 | `trace-compare` | Compare span volumes between two dates — identify which service spiked |
 
+### APM Monitoring MetricSet (MMS) Operations
+
+| Command | Description |
+|---------|-------------|
+| `apm-ops-scan` | Scan all APM operation names directly from the API — detects high-cardinality patterns, security/probe payloads, non-prod MTS waste, and exclusion candidates. No raw export from engineering needed. |
+| `apm-ops-history` | Trend history for `apm-ops-scan` runs |
+
 ### Cross-signal
 
 | Command | Description |
@@ -133,6 +140,26 @@ python3 cardinality_governance.py trace-compare \
 python3 cardinality_governance.py trace-compare \
   --date1 2026-04-01 --date2 now --environment myenv \
   --min-delta 5 --show-dropped
+```
+
+### APM Operations (MMS)
+
+```bash
+# Full scan — all environments, all four analysis passes
+python3 cardinality_governance.py apm-ops-scan
+
+# Scope to a single environment
+python3 cardinality_governance.py apm-ops-scan --environment prod-sfbu
+
+# Show top 50 parameterization patterns; skip security section
+python3 cardinality_governance.py apm-ops-scan --top 50 --no-attacks
+
+# Run without saving to history (read-only)
+python3 cardinality_governance.py apm-ops-scan --no-save
+
+# Show trend over past scans
+python3 cardinality_governance.py apm-ops-history
+python3 cardinality_governance.py apm-ops-history --environment prod-sfbu --limit 10
 ```
 
 ### Unified
@@ -623,6 +650,124 @@ python3 cardinality_governance.py watch --interval 300 --threshold 5000
 
 ![Cardinality Governance Report](reports/samplereport.png)
 
+## `apm-ops-scan` — APM operation name analysis
+
+```bash
+python3 cardinality_governance.py apm-ops-scan [--environment ENV] [--top N]
+```
+
+Fetches every unique APM Monitoring MetricSet operation directly from `GET /v2/metrictimeseries`
+and runs four analysis passes. No raw data export from engineering is required.
+
+```
+APM Operations Scan  (realm=us1)  env=prod-sfbu
+
+  10,000 unique operations fetched.  Running analysis...
+
+==========================================================================================
+  ENVIRONMENT DISTRIBUTION
+==========================================================================================
+  prod-sfbu                              321  ( 3.2%)  ◀ prod
+  devl-sfbu                            3,104  (31.0%)
+  acpt-sfbu                            2,890  (28.9%)
+  ...
+
+  Production total:        2,802  (28.0%)
+  Non-production total:    7,019  (70.0%)
+
+  [HIGH IMPACT]  70.0% of MMS operations come from non-prod.
+
+==========================================================================================
+  SECURITY PROBE DETECTION  —  329 attack payloads found in operation names
+==========================================================================================
+  Attack Type                           Count  Services
+  ─────────────────────────────────────────────────────────────────────────
+  DNS OOB (Burp Collaborator)             142  nginx-spcld-cssclearance-devl2
+  SQL injection — MSSQL                    87  nginx-spcld-cssclearance-devl2
+  SSTI (template injection)                44  nginx-acpt1-a:acqecnsvc-eco
+  Path traversal                           31  nginx-spcld-cssclearance-devl2
+  ...
+
+==========================================================================================
+  PARAMETERIZATION OPPORTUNITIES  —  top 30 patterns
+  Total MTS saveable via parameterization: 1,052
+==========================================================================================
+
+  Rank  Pattern                                                  Ops  Saved  Services
+  ──────────────────────────────────────────────────────────────────────────────────────
+  1     /case/{ID}                                               321    320  nginx-indmtrkr
+        e.g. /case/33315
+        e.g. /case/33465
+  2     /rebuttal/{ID}                                           309    308  nginx-indmtrkr
+  ...
+
+==========================================================================================
+  EXCLUSION CANDIDATES  —  1,220 operations with no APM value
+==========================================================================================
+  Health check endpoints                                         824
+  Static assets (JS chunks, fonts, tfe-eks-p2x hashes)          211
+  Swagger / API-doc endpoints                                    198
+  JVM classname spans                                              8
+  Bare HTTP method (broken instrumentation)                      168
+
+==========================================================================================
+  SUMMARY
+==========================================================================================
+  Total APM operations (MMS):         10,000
+  Production operations:               2,802  (28.0%)
+  Non-production operations:           7,019  (70.0%)
+  Attack/probe payloads detected:        329
+  Exclusion candidates:                1,220
+  Parameterization MTS saveable:       1,052
+  Est. overall reduction potential:    86.0%
+```
+
+### How it works
+
+The raw MMS data export from engineering is the same data returned by:
+```
+GET /v2/metrictimeseries?query=_exists_:sf_mms_id
+```
+Each row in an export maps directly to:
+- `dimensions.sf_operation` — the operation/endpoint name
+- `dimensions.sf_service` — the service
+- `dimensions.sf_environment` — the environment
+
+`apm-ops-scan` paginates this endpoint, deduplicates to unique `(operation, service, env)` triples,
+and runs the analysis automatically — no manual export needed.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--environment` / `-e` | all | Scope to a specific APM environment |
+| `--top` | 30 | Max parameterization patterns to show |
+| `--no-save` | off | Print only, don't persist snapshot |
+| `--no-attacks` | off | Skip security probe section |
+| `--no-exclusions` | off | Skip exclusion candidates section |
+| `--no-env` | off | Skip environment distribution section |
+
+---
+
+## `apm-ops-history` — MMS operation trend
+
+```bash
+python3 cardinality_governance.py apm-ops-history [--environment ENV] [--limit N]
+```
+
+Shows the trend of `apm-ops-scan` metrics over time — useful for confirming that
+parameterization fixes, WAF rules, or OTel Collector filter changes are actually
+reducing MTS consumption.
+
+```
+APM Operations Scan History  (realm=us1)  all environments
+
+  Date                    Ops  Attacks  Excl  Consol Saved  Non-Prod    Prod
+  ────────────────────────────────────────────────────────────────────────────
+  2026-07-14T08:40        10,000     329  1,220         1,052     7,019   2,802
+  2026-07-15T08:40         8,200 (-1800)  12   1,010           980     5,600   2,600
+```
+
+---
+
 ## State and persistence
 
 All state stored in `cardinality_state.db` (SQLite, auto-created):
@@ -634,6 +779,7 @@ All state stored in `cardinality_state.db` (SQLite, auto-created):
 | `remediations` | Resolved findings with peak/current MTS |
 | `ignored` | Active ignore patterns |
 | `trace_snapshots` | Per-service span counts — powers `trace-compare`, `usage-compare` |
+| `apm_ops_snapshots` | Per-run APM operation totals — powers `apm-ops-history` |
 
 ---
 
@@ -649,6 +795,11 @@ All state stored in `cardinality_state.db` (SQLite, auto-created):
 0 * * * *  cd /path/to/o11y-usage-governance && \
            SPLUNK_ACCESS_TOKEN=... SPLUNK_REALM=us1 \
            python3 cardinality_governance.py trace-scan --environment myenv
+
+# Daily APM operations scan — tracks MMS cardinality, attack probes, env waste
+0 9 * * *  cd /path/to/o11y-usage-governance && \
+           SPLUNK_ACCESS_TOKEN=... SPLUNK_REALM=us1 \
+           python3 cardinality_governance.py apm-ops-scan
 ```
 
 ---

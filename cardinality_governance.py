@@ -3062,13 +3062,13 @@ def generate_html_report(findings, use_claude=True, detector_map=None):
                 cost_cell = estimate_cost(mts) if mts is not None else '—'
                 sev_cell  = _sev_badge(sev) if sev else '<span style="color:var(--muted);font-size:11px">Low</span>'
                 rows += (
-                    f'<tr>'
-                    f'<td><code class="metric-name">{_h(metric)}</code></td>'
-                    f'<td style="text-align:right" data-val="{mts or 0}">{mts_cell}</td>'
-                    f'<td>{cost_cell}</td>'
-                    f'<td>{sev_cell}</td>'
-                    f'<td>{det_html or "<span style=\'color:var(--subtle);font-size:11px\'>—</span>"}</td>'
-                    f'</tr>'
+                    '<tr>'
+                    + f'<td><code class="metric-name">{_h(metric)}</code></td>'
+                    + f'<td style="text-align:right" data-val="{mts or 0}">{mts_cell}</td>'
+                    + f'<td>{cost_cell}</td>'
+                    + f'<td>{sev_cell}</td>'
+                    + ('<td>' + (det_html or "<span style='color:var(--subtle);font-size:11px'>—</span>") + '</td>')
+                    + '</tr>'
                 )
             out += (f'<div style="overflow-x:auto;margin-bottom:20px">'
                     f'<table><thead><tr>'
